@@ -67,6 +67,27 @@ test("tables are recognised by shape, so a renamed category (deep -> deep-low/de
   assert.match(report, /^deep-high\s.*기본$/m)
 })
 
+test("main profiles are read by shape: extra leading fields and spread provider lists (2026-09-24 bundle)", t => {
+  const h = fixture(t)
+  writeFileSync(join(h.extensions, "omo.js"), `var p1=["six","seven"],p2=["eight"];var q=Object.freeze({capable:{family:"daily",tier:"normal",displayName:"Capable",description:"General",models:[{providers:[...p1],model:"main",variant:"max"},{providers:[...p2,"nine"],model:"alt"}]},"deep-work":{family:"geeky",tier:"heavy",displayName:"Deep",models:[{providers:["eight"],model:"reason"}]}});throw new Error("must never execute installed source");`)
+  const result = routing.loadBuiltinRouting(h.env)
+  assert.equal(result.status, "loaded", result.reason)
+  assert.deepEqual(result.defaults.model_profiles.capable, [
+    { providers: ["six", "seven"], model: "main", variant: "max" },
+    { providers: ["eight", "nine"], model: "alt" },
+  ])
+  assert.equal(result.defaults.descriptions.model_profiles.capable, "General")
+})
+
+test("a spread without exactly one literal array definition is unsupported, not guessed", t => {
+  const h = fixture(t)
+  const table = `var q={capable:{displayName:"Capable",models:[{providers:[...p1],model:"main"}]}};`
+  for (const definitions of ["", `var p1=["six"];function f(){var p1=["other"]}`, "var p1=g();"]) {
+    writeFileSync(join(h.extensions, "omo.js"), definitions + table)
+    assert.equal(routing.loadBuiltinRouting(h.env).status, "unavailable", definitions || "no definition")
+  }
+})
+
 test("source discovery requires a known installed launcher and never guesses another installation", () => {
   assert.equal(routing.loadBuiltinRouting({}).status, "unavailable")
 })

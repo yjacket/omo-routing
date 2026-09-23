@@ -153,7 +153,7 @@ for (const verb of ["set", "add", "remove"]) {
 test("editing builtin alternatives expands canonical providers, not their display aliases", async t => {
   const h = fixture(t, {})
   await h.run("add deep claude-sdk-oauth/claude-fable-5-1:max")
-  assert.deepEqual(h.readConfig()["[senpi]"].categories.deep.models, [
+  assert.deepEqual(h.readConfig()["[native]"].categories.deep.models, [
     "openai-codex/swe-2-high:high", "github-copilot/swe-2-high:high",
     "future-provider/swe-2-high:high", "claude-sdk-oauth/claude-fable-5-1:max",
   ])

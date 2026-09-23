@@ -20,10 +20,11 @@
 //     <name>:   main | main:<model_profile> | <category> | <agent> | category:<n> | agent:<n>
 //     <model>:  provider/model[:variant]
 //     --profile <name> / --base pick the layer written; default is the current
-//     profile's `[senpi]` section (base when no profile is set).
+//     profile's `[native]` section (base when no profile is set).
 //
-// Resolution mirrors omo-task.js: layers merge base -> [senpi] -> profile base
-// -> profile [senpi]; objects deep-merge, arrays replace. Edits are applied to
+// Resolution mirrors omo-task.js: layers merge base -> [native] -> profile base
+// -> profile [native], where a layer without `[native]` uses its legacy
+// `[senpi]` section instead; objects deep-merge, arrays replace. Edits are applied to
 // the omo.jsonc text at byte offsets, so comments and formatting survive; a
 // copy of the previous file is kept as omo.jsonc.bak. Nothing is checked
 // against live provider state.
@@ -35,7 +36,7 @@ import { homedir, userInfo } from "node:os"
 export type Deps = { env?: Record<string, string | undefined>; home?: string }
 
 const SKIP_KEYS = new Set(["__proto__", "constructor", "prototype"])
-const HARNESS_KEYS = new Set(["[opencode]", "[senpi]", "[codex]"])
+const HARNESS_KEYS = new Set(["[opencode]", "[native]", "[senpi]", "[codex]", "[omo]"])
 
 /** Strip // and /* *\/ comments without touching string literals. */
 export function stripJsonc(src: string): string {
@@ -100,23 +101,29 @@ const withoutSpecial = (cfg: any): any => {
   for (const [k, v] of Object.entries(cfg ?? {})) if (k !== "profiles" && !HARNESS_KEYS.has(k)) out[k] = v
   return out
 }
-const harnessSection = (cfg: any, harness: string): any => (isObj(cfg?.[`[${harness}]`]) ? cfg[`[${harness}]`] : {})
+/** OMO renames a layer's legacy `[senpi]` to `[native]` on load and drops it
+ * when `[native]` is already there, so exactly one of them applies per layer. */
+const harnessSection = (cfg: any): any => {
+  const section = isObj(cfg) && Object.hasOwn(cfg, "[native]") ? cfg["[native]"] : cfg?.["[senpi]"]
+  return isObj(section) ? section : {}
+}
 
 export function profileNames(raw: any): string[] {
   return isObj(raw?.profiles) ? Object.keys(raw.profiles) : []
 }
 
 /**
- * Effective config for the senpi harness: base -> [senpi] -> profile base ->
- * profile [senpi]. `profile` is the name actually applied (undefined for base
- * or when the named profile does not exist, in which case `warning` is set).
+ * Effective config for the native harness: base -> [native] -> profile base ->
+ * profile [native] (`[senpi]` standing in for a missing `[native]`). `profile`
+ * is the name actually applied (undefined for base or when the named profile
+ * does not exist, in which case `warning` is set).
  */
-export function applyProfile(raw: any, profile: string | undefined, harness = "senpi"): { config: any; profile?: string; warning?: string } {
+export function applyProfile(raw: any, profile: string | undefined): { config: any; profile?: string; warning?: string } {
   const profiles = isObj(raw?.profiles) ? raw.profiles : {}
   const overlay = profile && isObj(profiles[profile]) ? profiles[profile] : undefined
   const warning = profile && !overlay ? `profile "${profile}" does not exist; showing the base configuration` : undefined
   let merged: any = {}
-  for (const layer of [withoutSpecial(raw), harnessSection(raw, harness), withoutSpecial(overlay), harnessSection(overlay, harness)])
+  for (const layer of [withoutSpecial(raw), harnessSection(raw), withoutSpecial(overlay), harnessSection(overlay)])
     merged = mergeConfig(merged, layer)
   return { config: withoutSpecial(merged), profile: overlay ? profile : undefined, warning }
 }
@@ -141,13 +148,15 @@ const rungs = (value: unknown): value is BuiltinRung[] => Array.isArray(value) &
   record(v) && strings(v.providers) && v.providers.length > 0 && typeof v.model === "string" && (v.variant === undefined || typeof v.variant === "string"))
 
 /** Read only JSON-like literal data, never import/eval the host's executable bundles.
- * OMO's shipped tables use quoted strings and unquoted property names. Any other
- * expression (calls, spreads, references, etc.) is unsupported, not executed.
+ * OMO's shipped tables use quoted strings and unquoted property names, and share
+ * provider lists through array spreads (`providers:[...a8]`). A spread is read
+ * from its literal `name=[...]` definition in the same bundle, never evaluated.
+ * Any other expression (calls, references, object spreads, etc.) is unsupported.
  */
-function sourceLiteral(source: string, start: number): unknown {
-  const token = /\s*("(?:\\.|[^"\\])*"|[A-Za-z_$][\w$]*|-?\d+(?:\.\d+)?|[{}[\]:,])/y
+function sourceLiteral(source: string, start: number, spreadDepth = 2): unknown {
+  const token = /\s*("(?:\\.|[^"\\])*"|\.\.\.[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*|-?\d+(?:\.\d+)?|[{}[\]:,])/y
   let cursor = start
-  let depth = 0
+  const open: string[] = []
   let json = ""
   do {
     token.lastIndex = cursor
@@ -155,18 +164,33 @@ function sourceLiteral(source: string, start: number): unknown {
     if (!match) return undefined
     const text = match[1]
     cursor = token.lastIndex
-    if (text === "{" || text === "[") depth++
-    if (text === "}" || text === "]") depth--
-    if (/^[A-Za-z_$]/.test(text)) {
+    if (text === "{" || text === "[") open.push(text)
+    if (text === "}" || text === "]") open.pop()
+    if (text.startsWith("...")) {
+      const items = open.at(-1) === "[" && spreadDepth > 0 ? spreadArray(source, text.slice(3), spreadDepth - 1) : undefined
+      if (!items?.length) return undefined
+      json += JSON.stringify(items).slice(1, -1)
+    } else if (/^[A-Za-z_$]/.test(text)) {
       if (/^\s*:/.test(source.slice(cursor))) json += JSON.stringify(text)
       else if (["true", "false", "null"].includes(text)) json += text
       else return undefined
     } else json += text
-  } while (depth > 0)
+  } while (open.length > 0)
   try { return JSON.parse(json) } catch (error) {
     if (error instanceof SyntaxError) return undefined
     throw error
   }
+}
+
+/** Elements behind `...name`: every `name=[...]` literal in the bundle must be
+ * the same array. Minifiers reuse short names across scopes, so conflicting or
+ * missing definitions are unsupported rather than guessed. */
+function spreadArray(source: string, name: string, spreadDepth: number): unknown[] | undefined {
+  const definition = new RegExp(`(?<![\\w$.])${name.replace(/\$/g, "\\$")}\\s*=(?!=)\\s*(?=\\[)`, "g")
+  const values = [...source.matchAll(definition)].map(match => sourceLiteral(source, match.index + match[0].length, spreadDepth))
+  if (!values.length || !values.every(Array.isArray)) return undefined
+  const first = JSON.stringify(values[0])
+  return values.every(value => JSON.stringify(value) === first) ? values[0] as unknown[] : undefined
 }
 
 /** Decode one quoted literal from the bundle; OMO ships both '…' and "…" strings. */
@@ -184,9 +208,11 @@ function sourceString(raw: string): string | undefined {
 const SOURCE_STRING = `("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`
 
 function builtinTables(source: string, main: boolean): Record<string, unknown>[] {
-  // The discriminator is the data shape, not minifier-generated variable names.
+  // The discriminator is the data shape, not minifier-generated variable names
+  // or field order: a main profile is any object whose first entry carries a
+  // `models` rung list (OMO added `family`/`tier` ahead of `displayName`).
   const pattern = main
-    ? /\{\s*(?:"[^"\\]+"|[\w$]+)\s*:\s*\{\s*displayName\s*:/g
+    ? /\{\s*(?:"[^"\\]+"|[\w$]+)\s*:\s*\{[^{}]*?\bmodels\s*:\s*\[\s*\{\s*providers\s*:/g
     : /\{\s*(?:"[^"\\]+"|[\w$]+)\s*:\s*\[\s*\{\s*providers\s*:/g
   return [...source.matchAll(pattern)].flatMap(match => {
     const value = sourceLiteral(source, match.index)
@@ -1097,12 +1123,14 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const target = resolveTarget(parsed.target, config)
     if (typeof target === "string") { ctx.ui.notify(`routing: ${target}`, "error"); return }
 
-    // Layer written: the profile's (or base's) `[senpi]` section when it exists
-    // or nothing else is there; otherwise the layer root.
+    // Layer written: the profile's (or base's) harness section OMO applies —
+    // `[native]`, else a legacy `[senpi]` — or a new `[native]` when the layer
+    // root holds no routing keys; otherwise the layer root.
     const layerPath = profile ? ["profiles", profile] : []
     const layer = profile ? raw.profiles[profile] : raw
-    const useSenpi = isObj(layer?.["[senpi]"]) || !["categories", "agents", "model_profiles"].some((k) => isObj(layer?.[k]))
-    const entryPath = [...layerPath, ...(useSenpi ? ["[senpi]"] : []), ...target.path]
+    const section = ["[native]", "[senpi]"].find((k) => isObj(layer?.[k]))
+      ?? (["categories", "agents", "model_profiles"].some((k) => isObj(layer?.[k])) ? undefined : "[native]")
+    const entryPath = [...layerPath, ...(section ? [section] : []), ...target.path]
 
     const chain = applyChainEdit(parsed.verb, chainOf(config?.[target.path[0]]?.[target.path[1]]), parsed.models, parsed.at)
     if (typeof chain === "string") { ctx.ui.notify(`routing: ${target.label}: ${chain}`, "error"); return }
@@ -1111,7 +1139,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     try { parseJsonc(next) } catch (e: any) { ctx.ui.notify(`routing: refusing to write, result is not valid JSON: ${e?.message ?? e}`, "error"); return }
     copyFileSync(cfgPath, cfgPath + ".bak")
     writeFileSync(cfgPath, next, "utf8")
-    const where = `${profile ? `profile ${profile}` : "base"}${useSenpi ? " [senpi]" : ""}`
+    const where = `${profile ? `profile ${profile}` : "base"}${section ? ` ${section}` : ""}`
     show(ctx, parseJsonc(next), profile, [`wrote ${target.label} in ${where}: ${formatChain(chain)}`, ""])
   }
 

@@ -278,6 +278,33 @@ test("/routing add|remove follow OMO_PROFILE and write only that profile's layer
   assert.deepEqual(parseJsonc(h.readCfg()).profiles.capacity["[senpi]"].categories.architect.models, ["claude-sdk-oauth/claude-fable-5-1:max", "github-copilot/claude-fable-5.1:max", "x/y"], "an entry inherited from base is created in the profile with the effective chain")
 })
 
+test("[native] is the harness section; a layer's legacy [senpi] applies only when it has no [native]", async () => {
+  const h = harness({ widget: false })
+  writeFileSync(h.cfgPath, JSON.stringify({
+    "[senpi]": { categories: { quick: { models: ["legacy/ignored"] } } },
+    "[native]": { task: { default_concurrency: 2 } },
+    categories: { quick: { models: ["root/model"] } },
+    profiles: {
+      migrated: { "[native]": { categories: { quick: { models: ["native/model"] } } } },
+      legacy: { "[senpi]": { categories: { quick: { models: ["senpi/model"] } } } },
+    },
+  }))
+  const raw = parseJsonc(h.readCfg())
+  assert.deepEqual(applyProfile(raw, undefined).config.categories.quick.models, ["root/model"])
+  assert.equal(applyProfile(raw, undefined).config["[native]"], undefined, "harness sections never leak into the effective config")
+  assert.deepEqual(applyProfile(raw, "migrated").config.categories.quick.models, ["native/model"])
+  assert.deepEqual(applyProfile(raw, "legacy").config.categories.quick.models, ["senpi/model"])
+  await h.run("set --profile migrated quick a/b")
+  assert.match(h.notes.at(-1).m, /^wrote category quick in profile migrated \[native\]: a\/b$/m)
+  await h.run("set --base quick c/d")
+  assert.match(h.notes.at(-1).m, /^wrote category quick in base \[native\]: c\/d$/m)
+  const cfg = parseJsonc(h.readCfg())
+  assert.deepEqual(cfg.profiles.migrated["[native]"].categories.quick.models, ["a/b"])
+  assert.deepEqual(cfg["[native]"].categories.quick.models, ["c/d"])
+  assert.deepEqual(cfg["[native]"].task, { default_concurrency: 2 }, "sibling keys survive")
+  assert.deepEqual(cfg["[senpi]"].categories.quick.models, ["legacy/ignored"], "an overridden legacy section is never written")
+})
+
 test("/routing set main, --profile, --base and agent:/category: prefixes", async () => {
   const h = harness({ env: { OMO_PROFILE: "capacity" }, widget: false })
   await h.run("set main a/b:c")

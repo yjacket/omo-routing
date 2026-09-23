@@ -66,8 +66,10 @@ stack cells in column order. No configuration is written.
   current profile (same resolution as the report) is written, or base when no
   profile is set. A profile named by the environment that does not exist is an
   error, not a silent write to base.
-- Inside the chosen layer the chain goes to `[senpi].<categories|agents|model_profiles>.<name>.models`
-  (or the layer root when the layer already keeps those keys at its root).
+- Inside the chosen layer the chain goes to `[native].<categories|agents|model_profiles>.<name>.models`
+  — the section OMO applies for that layer: `[native]`, else a legacy
+  `[senpi]` when that is the only one, else a new `[native]` (or the layer
+  root when the layer already keeps those keys at its root and has neither).
   `set` also drops a singular `model` key so the chain is exactly what was set.
 - The chain before the edit is the *effective* one (profile over base, with
   builtin defaults where applicable). `add`/`remove` materialize inherited
@@ -84,8 +86,8 @@ order, and the inline/multiline style of the touched value are preserved;
 new entries take the surrounding indentation. The previous file is copied to
 `omo.jsonc.bak` first, and the result is re-parsed before it is written. The
 report is then redrawn for the layer written, prefixed with
-`wrote <label> in profile <name>|base[ [senpi]]: <chain>` (`[senpi]` appears
-only when that section was the one written). The change takes
+`wrote <label> in profile <name>|base[ [native]|[senpi]]: <chain>` (the section
+appears only when a harness section was the one written). The change takes
 effect whenever the host next reads omo.jsonc. A malformed edit is an error
 pointing at `/routing help`.
 
@@ -149,8 +151,11 @@ Config overlays follow `omo-task.js`:
 
 - Profile name: `OMO_PROFILE` → `OCX_PROFILE` → basename of
   `OPENCODE_CONFIG_DIR` when it ends in `profiles/<name>`.
-- Layers merge in order: base → `[senpi]` → `profiles.<name>` base →
-  `profiles.<name>.[senpi]`. Objects deep-merge; arrays and scalars replace.
+- Layers merge in order: base → `[native]` → `profiles.<name>` base →
+  `profiles.<name>.[native]`. Objects deep-merge; arrays and scalars replace.
+  `[senpi]` is the legacy name of `[native]`: OMO renames it on load, so a
+  layer's `[senpi]` applies only when that layer has no `[native]`, and is
+  ignored otherwise. `[opencode]`, `[codex]` and `[omo]` never apply here.
 - `omo.jsonc` comments (`//`, `/* */`) are stripped before parsing; `omo.json`
   is used when no `.jsonc` exists.
 - Category nonempty `models` takes precedence over `model`; otherwise
@@ -166,7 +171,10 @@ Builtin discovery uses the host launcher's `OMO_BIN` to locate
 and `omo.js` (main model profiles). Only literal data is read; the bundles are
 never imported or executed, and no model list is copied into this extension.
 The adapter recognizes the installed bundle's table shapes, not minified
-variable names. Missing files, unsupported expressions, or ambiguous tables
+variable names or field order. A shared provider list spread into a rung
+(`providers:[...a8]`) is read from its literal `a8=[...]` definition in the
+same bundle; a spread with no such definition, or with conflicting ones, is
+unsupported. Missing files, unsupported expressions, or ambiguous tables
 produce a visible warning. Restart/reload the host after upgrading OMO so the
 source on disk and the running host agree.
 
