@@ -69,7 +69,7 @@ test("/routing edit opens on the named profile, saves through the file and redra
   const h = setup(t)
   await h.run("work")
   const { editor, options, finished } = await h.open("edit -p work")
-  assert.deepEqual(options, { overlay: true, overlayOptions: { width: "96%", maxHeight: "92%", minWidth: 40, margin: 1 } })
+  assert.deepEqual(options, { overlay: true, overlayOptions: { width: "96%", maxHeight: "80%", minWidth: 40, margin: 1 } })
   assert.match(screen(editor), /^라우팅 편집 · OMO 9\.9\.9-test · 편집 레이어: profile work \[native\] \(Tab 전환\)/)
   assert.ok(existsSync(h.snapshot), "the first open records the installed builtin as reviewed")
   assert.equal(JSON.parse(readFileSync(h.snapshot, "utf8")).omo, "9.9.9-test")

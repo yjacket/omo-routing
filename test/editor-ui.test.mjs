@@ -163,7 +163,8 @@ test("every rendered line is exactly the viewport width in every view, styled or
       press(editor, KEY.enter)
       views.push(editor.render(width))
       for (const lines of views) {
-        assert.ok(lines.length <= 22, `height ${lines.length} at 24 rows`)
+        // 80% of 24 rows: the overlay keeps a gap above it for omo's inline start offset.
+        assert.ok(lines.length <= 19, `height ${lines.length} at 24 rows`)
         for (const line of lines) assert.equal(cells(line), width, `width ${width}: ${JSON.stringify(strip(line))}`)
       }
       if (styled) assert.ok(views[0].some(line => line.includes("\x1b[")), "styling reaches the output")

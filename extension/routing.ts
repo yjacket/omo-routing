@@ -1846,8 +1846,12 @@ type Item = { text: string; color?: string; bold?: boolean; header?: boolean }
 
 const NO_EFFORT = "(없음)"
 const TONES: Record<Tone, string> = { info: "accent", success: "success", warning: "warning", error: "error" }
-/** Overlay placement for ctx.ui.custom; the component lays itself out to the same height. */
-export const EDITOR_OVERLAY = { width: "96%", maxHeight: "92%", minWidth: 40, margin: 1 } as const
+/** Overlay placement for ctx.ui.custom; the component lays itself out to the
+ * same height. Not full height: omo renders inline below the shell prompt, so
+ * until a session fills the terminal the top rows of the frame are off-screen,
+ * and a centered overlay needs that much room above it (history search uses 80% too). */
+export const EDITOR_OVERLAY = { width: "96%", maxHeight: "80%", minWidth: 40, margin: 1 } as const
+const EDITOR_HEIGHT = 0.8
 const draftKey = (profile: string | undefined, section: Section, name: string): string => `${profile ?? ""}\u0000${section}\u0000${name}`
 
 export type EditorOptions = {
@@ -2564,7 +2568,7 @@ export class RoutingEditor {
 
   private height(): number {
     const rows = Math.floor(Number(this.options.rows?.()) || 30)
-    return Math.max(8, Math.min(Math.floor(rows * 0.92), rows - 2))
+    return Math.max(8, Math.min(Math.floor(rows * EDITOR_HEIGHT), rows - 2))
   }
 }
 
