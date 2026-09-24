@@ -12,9 +12,9 @@ test("the list shows every node with its state; unconnected rungs are hidden wit
   assert.match(text, /^라우팅 편집 · OMO 1\.2\.3 · 편집 레이어: profile work \[native\] \(Tab 전환\)/)
   assert.match(text, /연결된 프로바이더: claude, codex, devin · 미연결 후보 숨김 \(h\)/)
   for (const label of ["main (capable)", "deep", "implementer", "quick", "writing", "explore", "reviewer"]) assert.ok(row(text, label), label)
-  assert.match(row(text, "deep"), /deep\s+base\s+claude\/claude-opus:H$/)
-  assert.match(row(text, "quick"), /quick\s+비활성\s+\(비활성\)$/)
-  assert.match(row(text, "writing"), /writing\s+빌트인\s+claude\/claude-fable:L$/)
+  assert.match(row(text, "deep"), /deep\s+-\s+base\s+claude\/claude-opus:H$/)
+  assert.match(row(text, "quick"), /quick\s+Fast small work…\s+비활성\s+\(비활성\)$/)
+  assert.match(row(text, "writing"), /writing\s+-\s+빌트인\s+claude\/claude-fable:L$/)
   const base = makeEditor()
   select(base.editor, "quick")
   const quick = screen(base.editor)
@@ -60,7 +60,7 @@ test("adding a connected model through the picker and effort view, then moving, 
   press(editor, "d")
   assert.deepEqual(editor.pending(), [], "removing every rung follows the builtin again, which base already did: no change")
   press(editor, KEY.esc)
-  assert.match(row(screen(editor), "writing"), /writing\s+빌트인\s+claude\/claude-fable:L$/)
+  assert.match(row(screen(editor), "writing"), /writing\s+-\s+빌트인\s+claude\/claude-fable:L$/)
 })
 
 test("follow, disable, undo and Tab keep separate drafts per layer; user-only nodes keep their last model", () => {
@@ -152,7 +152,7 @@ test("adjacent rungs of one model with different effort are flagged", () => {
 test("every rendered line is exactly the viewport width in every view, styled or not", () => {
   const theme = { fg: (color, text) => `\x1b[3${color.length % 8}m${text}\x1b[0m`, bold: text => `\x1b[1m${text}\x1b[22m` }
   for (const styled of [undefined, theme]) {
-    for (const width of [24, 40, 80, 140]) {
+    for (const width of [19, 24, 40, 80, 140]) {
       const { editor } = makeEditor({ profile: "work", theme: styled, rows: () => 24, warnings: ["프로젝트 설정 C:/very/long/path/.omo/omo.jsonc도 라우팅을 정합니다"] })
       select(editor, "writing", width)
       const views = [editor.render(width)]
@@ -170,6 +170,31 @@ test("every rendered line is exactly the viewport width in every view, styled or
       if (styled) assert.ok(views[0].some(line => line.includes("\x1b[")), "styling reaches the output")
     }
   }
+})
+
+test("a frame with the title in its top edge marks the overlay at every width; a view too small for it goes unframed", () => {
+  for (const width of [20, 40, 80, 140]) {
+    const lines = makeEditor({ profile: "work" }).editor.render(width).map(strip)
+    assert.match(lines[0], width >= 40 ? /^╭─ 라우팅 편집 · OMO 1\.2\.3 .* ─+╮$/ : /^╭─ 라우팅 편집.* ─+╮$/, `width ${width}`)
+    assert.match(lines.at(-1), /^╰─+╯$/)
+    assert.ok(lines.slice(1, -1).every(line => /^│ .* │$|^├─+┤$/.test(line)), `width ${width}: ${JSON.stringify(lines.find(line => !/^│ .* │$|^├─+┤$|^[╭╰]/.test(line)))}`)
+    assert.ok(lines.filter(line => /^├─+┤$/.test(line)).length >= 2, "section rules join the frame")
+  }
+  assert.doesNotMatch(strip(makeEditor().editor.render(19)[0]), /╭/, "under 20 cells")
+  assert.doesNotMatch(strip(makeEditor({ rows: () => 12 }).editor.render(80)[0]), /╭/, "under 10 rows of overlay")
+})
+
+test("each node's description is listed beside it while the chain keeps room, and always shown in the detail pane", () => {
+  const wide = screen(makeEditor().editor, 140)
+  assert.match(row(wide, "quick"), /^ {2}quick\s+Fast small work…\s+빌트인\s/)
+  assert.match(row(wide, "implementer"), /implementer\s+Writes production code\.\s+커스텀\s/)
+  const narrow = makeEditor()
+  select(narrow.editor, "quick", 80)
+  const text = screen(narrow.editor, 80)
+  assert.doesNotMatch(row(text, "quick"), /Fast small work/, "80 columns leave the chain its room")
+  assert.match(text, /^quick: Fast small work…$/m)
+  const marked = screen(makeEditor({ raw: { categories: { writing: { description: "**Loud** `code` text." } } } }).editor, 140)
+  assert.match(row(marked, "writing"), /writing\s+Loud code text\.\s+빌트인\s/, "markdown emphasis is dropped")
 })
 
 test("kitty CSI-u letters work; ctrl/alt chords are never read as letters", () => {

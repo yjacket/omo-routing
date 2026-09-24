@@ -179,8 +179,13 @@ The list holds every routing node of the installed OMO build: the selected main
 profile (read-only when `model_profile` is unset or pins a model), then every
 category and agent that is builtin or set in base or the profile. A category
 added by an OMO release appears without updating this extension; user-only
-nodes such as `implementer` are listed too. Each row has a state word for the
-layer being edited:
+nodes such as `implementer` are listed too. The overlay is framed, with its
+title in the top edge; the frame is laid out again at every width, so resizing
+the terminal redraws it whole (a view under 20 columns or 10 rows goes
+unframed). Each row shows what the node is for (the first sentence of its
+configured or builtin description, markdown emphasis removed) in its own column
+while the chain keeps at least 36 columns; the detail pane always shows it for
+the selected node. Each row also has a state word for the layer being edited:
 
 - `빌트인` (builtin): neither layer sets a chain; OMO's builtin applies and
   follows OMO updates.

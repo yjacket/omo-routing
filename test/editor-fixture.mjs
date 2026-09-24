@@ -66,19 +66,29 @@ export const strip = text => text.replace(ansi, "")
 /** Terminal cells of a rendered line: Hangul and CJK take two, ANSI styling none. */
 export const cells = text => [...segmenter.segment(strip(text))].reduce((sum, { segment }) => sum + (wide.test(segment) ? 2 : 1), 0)
 
+/** A rendered line without the overlay frame: the title from the top edge,
+ * the content between `│ ` and ` │`, a short rule for `├──┤`/`╰──╯`. */
+export function unframe(line) {
+  const text = strip(line)
+  if (text.startsWith("╭─ ")) return text.slice(3).replace(/ ─*╮$/, "")
+  if (/^[├╰]─*[┤╯]$/.test(text)) return "────────"
+  if (text.startsWith("│ ") && text.endsWith(" │")) return text.slice(2, -2)
+  return text
+}
+
 export const press = (editor, ...keys) => { for (const key of keys) editor.handleInput(key) }
 
 /** Move the list cursor down to the row labelled `label`. */
 export function select(editor, label, width = 140) {
   editor.handleInput("\x1b[H") // Home: rows above the cursor count too
   for (let i = 0; i < 40; i++) {
-    if (editor.render(width).some(line => strip(line).startsWith(`▸ ${label} `))) return
+    if (editor.render(width).some(line => unframe(line).startsWith(`▸ ${label} `))) return
     editor.handleInput(KEY.down)
   }
   assert.fail(`no list row ${label}`)
 }
 
-export const screen = (editor, width = 140) => editor.render(width).map(line => strip(line).trimEnd()).join("\n")
+export const screen = (editor, width = 140) => editor.render(width).map(line => unframe(line).trimEnd()).join("\n")
 
 export function makeEditor(options = {}) {
   const saves = []

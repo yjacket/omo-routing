@@ -1891,6 +1891,8 @@ const TONES: Record<Tone, string> = { info: "accent", success: "success", warnin
  * until a session fills the terminal the top rows of the frame are off-screen,
  * and a centered overlay needs that much room above it (history search uses 80% too). */
 export const EDITOR_OVERLAY = { width: "96%", maxHeight: "80%", minWidth: 40, margin: 1 } as const
+/** Descriptions are prompt prose; markdown emphasis only clutters a cell. */
+const plainText = (text: string): string => text.replace(/\*\*|__|`/g, "")
 /** Why a reload waits while the editor is open (the host shows it as "Hot-reload deferred: …"). */
 export const EDITOR_RELOAD_VETO = "/routing edit is open; the reload runs when it closes"
 const EDITOR_HEIGHT = 0.8
@@ -2365,38 +2367,57 @@ export class RoutingEditor {
    * view within the overlay height. */
   render(width: number): string[] {
     const w = Math.max(1, Math.floor(width))
+    // A frame with one cell of padding marks the overlay's edge over the chat
+    // behind it. Every frame is laid out for the current width, so a resize
+    // redraws it whole; a view too small for it goes unframed.
+    const framed = w >= 20 && this.height() >= 10
+    const iw = framed ? w - 4 : w
     const nodes = this.nodes()
     this.cursor = Math.max(0, Math.min(this.cursor, nodes.length - 1))
     if (this.mode.kind !== "list" && !this.node(this.mode.key)) this.mode = { kind: "list" }
     const mode = this.mode
     const focus = mode.kind === "list" ? nodes[this.cursor] : this.node(mode.key)
-    const height = this.height()
+    const height = this.height() - (framed ? 2 : 0)
     // The body keeps at least three rows: key help, then header notes give way.
-    const header = this.headerItems(w)
-    const keys = this.wrapped(this.keyHelp(), w, "dim")
-    const status = this.statusItems(w)
+    const header = [...(framed ? [] : [{ text: this.titleText(), color: "accent", bold: true }]), ...this.headerItems(iw)]
+    const keys = this.wrapped(this.keyHelp(), iw, "dim")
+    const status = this.statusItems(iw)
     const fixed = (): number => header.length + keys.length + status.length + 1
     const keyLines = keys.length
     while (fixed() + 3 > height && keys.length > 1) keys.pop()
     if (keys.length < keyLines) keys[keys.length - 1] = { ...keys[keys.length - 1], text: `${keys[keys.length - 1].text.trimEnd()} …` }
     while (fixed() + 3 > height && header.length > 1) header.pop()
     const room = Math.max(3, height - fixed())
-    const detail = mode.kind === "list" || mode.kind === "chain" ? this.detailItems(focus, w) : []
+    const detail = mode.kind === "list" || mode.kind === "chain" ? this.detailItems(focus, iw) : []
     let detailRows = Math.min(detail.length, Math.floor(room * 0.4), room - 4)
     if (detailRows < 2) detailRows = 0
     const bodyRows = room - (detailRows ? detailRows + 1 : 0)
     if (mode.kind === "list") this.listRows = bodyRows
-    const body = mode.kind === "list" ? this.listItems(nodes)
+    const body = mode.kind === "list" ? this.listItems(nodes, iw)
       : mode.kind === "chain" ? this.chainItems(focus as EditorNode, mode)
       : mode.kind === "picker" ? this.pickerItems(mode) : this.effortItems(mode)
-    const rule: Item = { text: "─".repeat(w), color: "borderMuted" }
     const shown = detail.length > detailRows ? [...detail.slice(0, detailRows - 1), { text: "  …", color: "dim" }] : detail
-    return [
-      ...[...header, rule].map(item => this.line(item, w)),
-      ...this.window(body.items, body.focus, bodyRows, w, mode.kind),
-      ...(detailRows ? [rule, ...shown] : []).map(item => this.line(item, w)),
-      ...[...keys, ...status].map(item => this.line(item, w)),
+    // null: a rule between sections.
+    const rows: (string | null)[] = [
+      ...header.map(item => this.line(item, iw)), null,
+      ...this.window(body.items, body.focus, bodyRows, iw, mode.kind),
+      ...(detailRows ? [null, ...shown.map(item => this.line(item, iw))] : []),
+      ...[...keys, ...status].map(item => this.line(item, iw)),
     ]
+    if (!framed) return rows.map(row => row ?? this.line({ text: "─".repeat(w), color: "borderMuted" }, w))
+    const edge = (text: string): string => this.paint("border", text)
+    const title = fitCells(this.titleText(), w - 6).trimEnd()
+    return [
+      `${edge("╭─ ")}${this.line({ text: title, color: "accent", bold: true }, displayWidth(title))}${edge(` ${"─".repeat(w - 5 - displayWidth(title))}╮`)}`,
+      ...rows.map(row => (row === null ? edge(`├${"─".repeat(w - 2)}┤`) : `${edge("│")} ${row} ${edge("│")}`)),
+      edge(`╰${"─".repeat(w - 2)}╯`),
+    ]
+  }
+
+  private titleText(): string {
+    const { omo, profile } = this.options
+    const section = harnessKey(layerObject(this.raw, { profile: this.layer }))
+    return `라우팅 편집${omo ? ` · OMO ${omo}` : ""} · 편집 레이어: ${this.layerLabel()}${section ? ` ${section}` : ""}${profile !== undefined ? " (Tab 전환)" : ""}`
   }
 
   private paint(color: string, text: string): string {
@@ -2453,13 +2474,10 @@ export class RoutingEditor {
     return parts.join(" · ")
   }
 
+  /** Header notes below the title: connected providers, builtin changes, warnings. */
   private headerItems(width: number): Item[] {
-    const { omo, profile, availability, warnings = [] } = this.options
-    const section = harnessKey(layerObject(this.raw, { profile: this.layer }))
-    const items: Item[] = [{
-      text: `라우팅 편집${omo ? ` · OMO ${omo}` : ""} · 편집 레이어: ${this.layerLabel()}${section ? ` ${section}` : ""}${profile !== undefined ? " (Tab 전환)" : ""}`,
-      color: "accent", bold: true,
-    }]
+    const { availability, warnings = [] } = this.options
+    const items: Item[] = []
     items.push(...this.wrapped(availability.known
       ? `연결된 프로바이더: ${availability.providers.map(labelProvider).join(", ") || "없음"} · 미연결 후보 ${this.showHidden ? "표시 중" : "숨김"} (h)`
       : `구독 정보를 읽지 못해 모든 후보를 표시합니다 (${availability.reason})`, width, availability.known ? "muted" : "warning"))
@@ -2506,8 +2524,15 @@ export class RoutingEditor {
     return kind === "new" ? "NEW" : kind === "changed" ? "변경됨" : kind === "removed" ? "제거됨" : ""
   }
 
-  private listItems(nodes: EditorNode[]): { items: Item[]; focus: number } {
+  private listItems(nodes: EditorNode[], width: number): { items: Item[]; focus: number } {
     const nameWidth = Math.min(24, Math.max(4, ...nodes.map(node => displayWidth(node.label))))
+    // What each node is for, in its own column while the chain keeps 36 cells;
+    // the detail pane always has it for the selected node.
+    const rest = width - (2 + nameWidth + 2 + 6 + 2 + 8 + 2)
+    const described = nodes.some(node => node.description !== EMPTY_CELL)
+    const descriptionWidth = described && rest >= 36 + 14 + 2
+      ? Math.min(40, Math.max(14, Math.floor(rest * 0.35)), Math.max(...nodes.map(node => displayWidth(plainText(node.description)))))
+      : 0
     const items: Item[] = []
     let focus = 0
     let section: string | undefined
@@ -2522,7 +2547,7 @@ export class RoutingEditor {
       const badges = [this.badge(node), this.dirty(node) ? "*" : "", nodeWarnings(node, this.options.availability).length ? "⚠" : ""].filter(Boolean).join(" ")
       const summary = node.readOnly ?? (node.effective.source === "disabled" ? "(비활성)" : this.chainText(node.effective.display, true))
       items.push({
-        text: `${selected ? "▸" : " "} ${padCells(node.label, nameWidth)}  ${padCells(nodeState(node, this.layer), 6)}  ${padCells(badges, 8)}  ${summary}`,
+        text: `${selected ? "▸" : " "} ${padCells(node.label, nameWidth)}  ${descriptionWidth ? `${fitCells(plainText(node.description), descriptionWidth)}  ` : ""}${padCells(nodeState(node, this.layer), 6)}  ${padCells(badges, 8)}  ${summary}`,
         color: selected ? "accent" : node.effective.source === "disabled" ? "dim" : undefined, bold: selected,
       })
     })
@@ -2586,7 +2611,7 @@ export class RoutingEditor {
     const add = (text: string, color?: string): void => {
       out.push(...wrapText(text, width, width >= 12 ? "    " : "").map(line => ({ text: line, color })))
     }
-    add(`${node.label}: ${node.description}`, "muted")
+    add(`${node.label}: ${plainText(node.description)}`)
     if (node.readOnly) {
       add(node.readOnly)
       return out
