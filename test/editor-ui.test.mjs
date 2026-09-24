@@ -184,6 +184,27 @@ test("a frame with the title in its top edge marks the overlay at every width; a
   assert.doesNotMatch(strip(makeEditor({ rows: () => 12 }).editor.render(80)[0]), /╭/, "under 10 rows of overlay")
 })
 
+test("the overlay keeps one height across nodes and views, and is only as tall as the list needs", () => {
+  for (const [width, rows] of [[140, 60], [80, 24]]) {
+    const { editor } = makeEditor({ profile: "work", rows: () => rows })
+    const heights = []
+    const record = () => heights.push(editor.render(width).length)
+    record()
+    select(editor, "quick", width)
+    record()
+    select(editor, "writing", width)
+    record()
+    press(editor, KEY.enter)
+    record()
+    press(editor, "a")
+    record()
+    press(editor, KEY.enter)
+    record()
+    assert.equal(new Set(heights).size, 1, `${width}x${rows}: ${heights}`)
+    if (rows === 60) assert.ok(heights[0] < 40, `a short list leaves the 80% budget unused instead of padding it (${heights[0]} rows)`)
+  }
+})
+
 test("each node's description is listed beside it while the chain keeps room, and always shown in the detail pane", () => {
   const wide = screen(makeEditor().editor, 140)
   assert.match(row(wide, "quick"), /^ {2}quick\s+Fast small work…\s+빌트인\s/)

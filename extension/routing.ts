@@ -1886,6 +1886,8 @@ type Item = { text: string; color?: string; bold?: boolean; header?: boolean }
 
 const NO_EFFORT = "(없음)"
 const TONES: Record<Tone, string> = { info: "accent", success: "success", warning: "warning", error: "error" }
+/** Detail pane height: description, builtin, previous builtin, base, profile, effective, two warnings. */
+const DETAIL_ROWS = 8
 /** Overlay placement for ctx.ui.custom; the component lays itself out to the
  * same height. Not full height: omo renders inline below the shell prompt, so
  * until a session fills the terminal the top rows of the frame are off-screen,
@@ -2378,30 +2380,43 @@ export class RoutingEditor {
     const mode = this.mode
     const focus = mode.kind === "list" ? nodes[this.cursor] : this.node(mode.key)
     const height = this.height() - (framed ? 2 : 0)
-    // The body keeps at least three rows: key help, then header notes give way.
+    // One size while moving around, so the centered overlay never jumps: key
+    // help and status get the rows their longest variant needs, the body is as
+    // tall as the list (not the whole budget), the detail pane keeps a fixed
+    // height, and the picker and effort views use the list and detail space
+    // together. Short of rows, key help and then header notes give way; the
+    // body keeps at least three rows.
     const header = [...(framed ? [] : [{ text: this.titleText(), color: "accent", bold: true }]), ...this.headerItems(iw)]
-    const keys = this.wrapped(this.keyHelp(), iw, "dim")
+    const keyText = this.wrapped(this.keyHelp(mode.kind), iw, "dim")
+    const keys = [...keyText]
+    const keyRows = Math.max(...(["list", "chain"] as const).map(kind => this.wrapped(this.keyHelp(kind), iw).length))
+    while (keys.length < keyRows) keys.push({ text: "" })
     const status = this.statusItems(iw)
+    while (status.length < 2) status.push({ text: "" })
     const fixed = (): number => header.length + keys.length + status.length + 1
-    const keyLines = keys.length
     while (fixed() + 3 > height && keys.length > 1) keys.pop()
-    if (keys.length < keyLines) keys[keys.length - 1] = { ...keys[keys.length - 1], text: `${keys[keys.length - 1].text.trimEnd()} …` }
+    if (keys.length < keyText.length) keys[keys.length - 1] = { ...keys[keys.length - 1], text: `${keys[keys.length - 1].text.trimEnd()} …` }
     while (fixed() + 3 > height && header.length > 1) header.pop()
     const room = Math.max(3, height - fixed())
-    const detail = mode.kind === "list" || mode.kind === "chain" ? this.detailItems(focus, iw) : []
-    let detailRows = Math.min(detail.length, Math.floor(room * 0.4), room - 4)
-    if (detailRows < 2) detailRows = 0
-    const bodyRows = room - (detailRows ? detailRows + 1 : 0)
-    if (mode.kind === "list") this.listRows = bodyRows
     const body = mode.kind === "list" ? this.listItems(nodes, iw)
       : mode.kind === "chain" ? this.chainItems(focus as EditorNode, mode)
       : mode.kind === "picker" ? this.pickerItems(mode) : this.effortItems(mode)
+    const listLength = mode.kind === "list" ? body.items.length : this.listItems(nodes, iw).items.length
+    let detailRows = Math.min(DETAIL_ROWS, Math.floor(room * 0.4), room - 4)
+    if (detailRows < 2) detailRows = 0
+    const detailSpace = detailRows ? detailRows + 1 : 0
+    const listRows = Math.max(3, Math.min(listLength, room - detailSpace))
+    const pane = (mode.kind === "list" || mode.kind === "chain") && detailRows > 0
+    const bodyRows = pane ? listRows : listRows + detailSpace
+    if (mode.kind === "list") this.listRows = bodyRows
+    const detail = pane ? this.detailItems(focus, iw) : []
     const shown = detail.length > detailRows ? [...detail.slice(0, detailRows - 1), { text: "  …", color: "dim" }] : detail
+    while (pane && shown.length < detailRows) shown.push({ text: "" })
     // null: a rule between sections.
     const rows: (string | null)[] = [
       ...header.map(item => this.line(item, iw)), null,
       ...this.window(body.items, body.focus, bodyRows, iw, mode.kind),
-      ...(detailRows ? [null, ...shown.map(item => this.line(item, iw))] : []),
+      ...(pane ? [null, ...shown.map(item => this.line(item, iw))] : []),
       ...[...keys, ...status].map(item => this.line(item, iw)),
     ]
     if (!framed) return rows.map(row => row ?? this.line({ text: "─".repeat(w), color: "borderMuted" }, w))
@@ -2497,8 +2512,8 @@ export class RoutingEditor {
     return `빌트인 변경${drift.since ? ` (OMO ${drift.since}에서 확인한 뒤)` : ""}: ${parts.join(" · ")} · c: 확인 처리`
   }
 
-  private keyHelp(): string {
-    switch (this.mode.kind) {
+  private keyHelp(kind: EditorMode["kind"]): string {
+    switch (kind) {
       case "list":
         return ["↑↓ 이동", "Enter 체인 편집", "r 기본값 따르기", "x 비활성 전환", "u 변경 취소", "h 미연결 후보",
           ...(this.options.profile !== undefined ? ["Tab 레이어"] : []), ...(this.drift?.count ? ["c 변경 확인"] : []), "s 저장", "q 닫기"].join(" · ")
