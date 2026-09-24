@@ -51,9 +51,12 @@ function setup(t, { config = CONFIG, mode = "tui", custom = true, cwd } = {}) {
       } : {}),
     },
   }
-  createRouting({ registerCommand: (_name, def) => { command = def }, on() {} }, { home, env: { OMO_BIN: join(root, "bin", "omo.js") } })
+  const events = {}
+  createRouting({ registerCommand: (_name, def) => { command = def }, on: (name, fn) => { events[name] = fn } }, { home, env: { OMO_BIN: join(root, "bin", "omo.js") } })
   return {
     home, cfgPath, notes, widgets,
+    /** Deliver a host event (e.g. session_before_reload) and return the handler's result. */
+    fire: name => events[name]({ type: name }, ctx),
     snapshot: join(home, ".omo", "routing-builtin-snapshot.json"),
     run: args => command.handler(args, ctx),
     /** Run `/routing <args>` and resolve with the overlay once it is open. */
@@ -70,6 +73,9 @@ test("/routing edit opens on the named profile, saves through the file and redra
   await h.run("work")
   const { editor, options, finished } = await h.open("edit -p work")
   assert.deepEqual(options, { overlay: true, overlayOptions: { width: "96%", maxHeight: "80%", minWidth: 40, margin: 1 } })
+  assert.deepEqual(await h.fire("session_before_reload"), { cancel: true, reason: "/routing edit is open; the reload runs when it closes" },
+    "an open editor holds off OMO's hot reload of omo.jsonc")
+  assert.ok(h.widgets.routing, "and the refused reload leaves the widget alone")
   assert.match(screen(editor), /^라우팅 편집 · OMO 9\.9\.9-test · 편집 레이어: profile work \[native\] \(Tab 전환\)/)
   assert.ok(existsSync(h.snapshot), "the first open records the installed builtin as reviewed")
   assert.equal(JSON.parse(readFileSync(h.snapshot, "utf8")).omo, "9.9.9-test")
@@ -82,8 +88,10 @@ test("/routing edit opens on the named profile, saves through the file and redra
   assert.match(text, /\/\/ my routing/)
   assert.deepEqual(parseJsonc(text).profiles.work["[native]"].categories.quick, { models: ["chatgpt-subscription/gpt-mini:low", "devin/swe-2-high"] })
   assert.equal(readFileSync(`${h.cfgPath}.bak`, "utf8"), CONFIG)
-  assert.match(h.notes.at(-1).message, /^routing: saved 1 change\(s\) to .*omo\.jsonc \(previous version: .*omo\.jsonc\.bak\); \/reload to apply$/)
+  assert.match(h.notes.at(-1).message, /^routing: saved 1 change\(s\) to .*omo\.jsonc \(previous version: .*omo\.jsonc\.bak\); OMO hot-reloads it now that the editor is closed \(\/reload if hot reload is off\)$/)
   assert.match(h.widgets.routing, /^quick .*codex\/gpt-mini:L → devin\/swe-2-high \[configured\]/m, "the shown report is redrawn from the saved file")
+  assert.equal(await h.fire("session_before_reload"), undefined, "once the editor is closed, reloads proceed")
+  assert.equal(h.widgets.routing, undefined)
 })
 
 test("/routing edit refuses outside the TUI and on bad arguments; nothing is written", async t => {
@@ -117,7 +125,7 @@ test("a missing omo.jsonc is created on save, and --base edits base alone", asyn
   assert.deepEqual(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.deep.models, ["chatgpt-subscription/gpt-big:high"])
   assert.equal(readFileSync(`${h.cfgPath}.bak`, "utf8"), "an unrelated backup from an older session",
     "no file existed before this session, so no save backs anything up over the old .bak")
-  assert.match(h.notes.at(-1).message, /^routing: saved 2 change\(s\) to .*omo\.jsonc; \/reload to apply$/, "and the notice cites no backup")
+  assert.match(h.notes.at(-1).message, /^routing: saved 2 change\(s\) to .*omo\.jsonc; OMO hot-reloads it now/, "and the notice cites no backup")
 })
 
 test("reports show builtin changes since the last review and project configs, and never write the snapshot", async t => {

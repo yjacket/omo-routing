@@ -1891,6 +1891,8 @@ const TONES: Record<Tone, string> = { info: "accent", success: "success", warnin
  * until a session fills the terminal the top rows of the frame are off-screen,
  * and a centered overlay needs that much room above it (history search uses 80% too). */
 export const EDITOR_OVERLAY = { width: "96%", maxHeight: "80%", minWidth: 40, margin: 1 } as const
+/** Why a reload waits while the editor is open (the host shows it as "Hot-reload deferred: …"). */
+export const EDITOR_RELOAD_VETO = "/routing edit is open; the reload runs when it closes"
 const EDITOR_HEIGHT = 0.8
 const draftKey = (profile: string | undefined, section: Section, name: string): string => `${profile ?? ""}\u0000${section}\u0000${name}`
 
@@ -2143,7 +2145,7 @@ export class RoutingEditor {
     this.drafts.clear()
     this.saved += result.count
     this.changed()
-    this.say(`저장했습니다: ${result.count}건 → ${this.options.configPath ?? "omo.jsonc"}${result.backup ? " (이전 파일은 .bak)" : ""}. /reload 하면 적용됩니다`, "success")
+    this.say(`저장했습니다: ${result.count}건 (${this.options.configPath ?? "omo.jsonc"}${result.backup ? ", 이전 파일은 .bak" : ""}). 편집기를 닫으면 OMO가 다시 불러와 적용합니다 (자동 반영이 꺼져 있으면 /reload)`, "success")
   }
 
   private close(confirmed: boolean): void {
@@ -2495,7 +2497,7 @@ export class RoutingEditor {
   private statusItems(width: number): Item[] {
     const status = this.message
       ?? (this.drafts.size ? { text: `저장 안 된 변경 ${this.drafts.size}건 · s 저장`, tone: "warning" as Tone }
-        : this.saved ? { text: `이번에 저장한 변경 ${this.saved}건 · /reload 하면 적용됩니다`, tone: "success" as Tone } : undefined)
+        : this.saved ? { text: `이번에 저장한 변경 ${this.saved}건 · 편집기를 닫으면 적용됩니다`, tone: "success" as Tone } : undefined)
     return status ? this.wrapped(status.text, width, TONES[status.tone]).slice(0, 2) : [{ text: "" }]
   }
 
@@ -2617,13 +2619,20 @@ export function createRouting(pi: any, deps: Deps = {}) {
   const home = deps.home ?? (userInfo().homedir || homedir())
 
   let shown = false
+  // OMO hot-reloads omo.jsonc when it changes, and a reload tears down an open
+  // /routing edit with its unsaved edits; the editor holds reloads off until it
+  // closes (the host defers and retries, then applies the saved file).
+  let editing = false
   // The host keeps extension widgets across /reload while this closure is
   // recreated, so the old instance clears its widget before reload and the new
   // one clears any leftover on start; otherwise the first /routing after a
   // reload would redraw instead of hiding.
   const hide = (ctx: any) => { if (typeof ctx?.ui?.setWidget === "function") ctx.ui.setWidget("routing", undefined); shown = false }
   if (typeof pi.on === "function") {
-    pi.on("session_before_reload", async (_e: unknown, ctx: any) => { hide(ctx) })
+    pi.on("session_before_reload", async (_e: unknown, ctx: any) => {
+      if (editing) return { cancel: true, reason: EDITOR_RELOAD_VETO }
+      hide(ctx)
+    })
     pi.on("session_start", async (_e: unknown, ctx: any) => { hide(ctx) })
   }
 
@@ -2743,7 +2752,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const availability = availabilityOf(ctx.modelRegistry)
     let backedUp = false
     let backupPath: string | undefined
-    const result = await ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: { saved: number }) => void) => new RoutingEditor({
+    const open = () => ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: { saved: number }) => void) => new RoutingEditor({
       raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
       drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
       levels: model => effortLevels(model, levels),
@@ -2767,10 +2776,17 @@ export function createRouting(pi: any, deps: Deps = {}) {
       rows: () => tui?.terminal?.rows ?? 30,
       requestRender: () => tui?.requestRender?.(),
     }, theme, keybindings), { overlay: true, overlayOptions: { ...EDITOR_OVERLAY } })
+    let result: any
+    editing = true
+    try {
+      result = await open()
+    } finally {
+      editing = false
+    }
     const saved = typeof result?.saved === "number" ? result.saved : 0
     if (!saved) return
     const backup = backupPath ? ` (previous version: ${backupPath})` : ""
-    ctx.ui.notify(`routing: saved ${saved} change(s) to ${cfgPath}${backup}; /reload to apply`, "info")
+    ctx.ui.notify(`routing: saved ${saved} change(s) to ${cfgPath}${backup}; OMO hot-reloads it now that the editor is closed (/reload if hot reload is off)`, "info")
     if (shown && lastView) {
       const text = findConfig()
       show(ctx, text ? parseJsonc(readFileSync(text, "utf8")) : {}, lastView.wanted, [], lastView.build)

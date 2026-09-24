@@ -242,8 +242,12 @@ The result must parse; the file as it was before the session's first save is
 kept as `omo.jsonc.bak` (later saves in the same session keep that copy); a
 missing omo.jsonc is created. If the file changed on disk after the editor
 opened, the first `s` warns and a second `s` applies the edits on top of the
-newer file. Saved changes take effect after `/reload`; the closing notice says
-so, and a shown `/routing` widget is redrawn from the saved file.
+newer file. OMO watches omo.jsonc and hot-reloads it when it changes. A reload
+would close the editor and drop unsaved edits, so while the editor is open it
+holds reloads off (OMO shows `Hot-reload deferred: /routing edit is open; ...`),
+and the saved changes are applied as soon as it closes; with OMO's hot reload
+turned off, `/reload` applies them. The closing notice says so, and a shown
+`/routing` widget is redrawn from the saved file.
 
 Builtin changes: the editor keeps the builtin routing you last reviewed in
 `~/.omo/routing-builtin-snapshot.json`. The first `/routing edit` records the

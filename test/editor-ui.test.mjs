@@ -102,7 +102,7 @@ test("save passes the exact drafts; an external change needs a second s; closing
   press(editor, "s")
   assert.deepEqual(saves.map(save => save.confirm), [false, true])
   assert.deepEqual(saves[1].drafts, [{ section: "categories", name: "writing", disable: true }])
-  assert.match(screen(editor), /저장했습니다: 1건 → C:\/home\/\.omo\/omo\.jsonc \(이전 파일은 \.bak\)\. \/reload 하면 적용됩니다/)
+  assert.match(screen(editor).replace(/\s+/g, " "), /저장했습니다: 1건 \(C:\/home\/\.omo\/omo\.jsonc, 이전 파일은 \.bak\)\. 편집기를 닫으면 OMO가 다시 불러와 적용합니다/)
   external = false
   press(editor, "q")
   assert.deepEqual(closed, [{ saved: 1 }])
