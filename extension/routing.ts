@@ -2417,7 +2417,9 @@ export class RoutingEditor {
       ...header.map(item => this.line(item, iw)), null,
       ...this.window(body.items, body.focus, bodyRows, iw, mode.kind),
       ...(pane ? [null, ...shown.map(item => this.line(item, iw))] : []),
-      ...[...keys, ...status].map(item => this.line(item, iw)),
+      // Reserved rows go above the footer, so key help sits on the bottom edge.
+      ...[...keys, ...status].filter(item => !item.text).map(() => " ".repeat(iw)),
+      ...[...status, ...keys].filter(item => item.text).map(item => this.line(item, iw)),
     ]
     if (!framed) return rows.map(row => row ?? this.line({ text: "─".repeat(w), color: "borderMuted" }, w))
     const edge = (text: string): string => this.paint("border", text)
