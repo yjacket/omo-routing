@@ -145,6 +145,21 @@ test("reports show builtin changes since the last review and project configs, an
   assert.match(notices[0], /proj[\\/]\.omo[\\/]omo\.jsonc also sets routing; OMO merges it over ~\/\.omo\/omo\.jsonc in sessions started under /)
 })
 
+test("an unreadable builtin table still opens the editor with configured chains and a warning; the snapshot guesses nothing", async t => {
+  const h = setup(t)
+  writeFileSync(join(h.home, "omo-ai", "plugin", "extensions", "omo-task.js"), "export const unrelated = {}")
+  const { editor, finished } = await h.open("edit --base")
+  const text = screen(editor)
+  assert.match(text, /⚠ 빌트인 category chains을 읽지 못해 그 노드는 설정된 체인만 보입니다/)
+  assert.match(text, /^\s+deep\s+커스텀\s+claude\/claude-opus:H$/m, "configured chains still show")
+  assert.doesNotMatch(text, /^\s+quick\s/m, "no builtin category is invented")
+  press(editor, "q")
+  await finished
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(h.snapshot, "utf8")).sections), ["model_profiles"],
+    "only the readable section is recorded as reviewed")
+  assert.equal(readFileSync(h.cfgPath, "utf8"), CONFIG)
+})
+
 test("/routing help lists the edit form and the hint names it", async t => {
   const h = setup(t)
   await h.run("help")
