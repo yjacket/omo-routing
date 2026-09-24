@@ -1,9 +1,9 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { createRouting, widgetFactory } from "../extension/routing.ts"
+import { fixtureDir } from "./fixture-dir.mjs"
 
 const providers = ["claude-sdk-oauth", "github-copilot", "amazon-bedrock", "google-vertex-anthropic"]
 const model = "claude-a-very-long-model-identifier-20260919:max"
@@ -12,7 +12,7 @@ const compact = text => text.replace(/\s/gu, "")
 
 // Exercise the factory registered by the real command, not a prewrapped string array.
 test("routing widget render fits builtin rungs, model IDs, sources, paths and fallbacks on resize", async t => {
-  const home = mkdtempSync(join(tmpdir(), "routing-viewport-"))
+  const home = fixtureDir("routing-viewport-")
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const extensions = join(home, "installed-omo-with-a-long-directory-name", "plugin", "extensions")
   mkdirSync(extensions, { recursive: true })

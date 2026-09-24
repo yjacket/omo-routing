@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as routing from "../extension/routing.ts"
+import { fixtureDir } from "./fixture-dir.mjs"
 
 // Data-only extracts with the same layout as the installed minified OMO bundles.
 // Different identifiers/models ensure discovery cannot depend on minifier names or copied models.
@@ -11,7 +12,7 @@ const TASK_SOURCE = `var renamed={quick:[{providers:["one","two"],model:"fast",v
 const MAIN_SOURCE = `var changed=Object.freeze({capable:{displayName:"Capable",description:"General",models:[{providers:["six","seven"],model:"main",variant:"max"}]},"deep-work":{displayName:"Deep",description:"Hard",models:[{providers:["eight"],model:"reason"}]}});throw new Error("must never execute installed source");`
 
 function fixture(t, config) {
-  const home = mkdtempSync(join(tmpdir(), "routing-defaults-"))
+  const home = fixtureDir("routing-defaults-")
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const root = join(home, "installed omo")
   const extensions = join(root, "plugin", "extensions")
@@ -45,12 +46,30 @@ test("installed defaults are read without executing the host when user config is
   assert.equal(row(h.reports.at(-1).message, "explore"), "four/search")
 })
 
-test("source discovery reports unavailable rather than claiming defaults on unsupported bundles", t => {
+test("an unrecognizable bundle leaves only its own sections unavailable, and never claims defaults it could not read", t => {
   const h = fixture(t)
   writeFileSync(join(h.extensions, "omo-task.js"), "export const unrelated = {}")
-  const result = routing.loadBuiltinRouting(h.env)
-  assert.equal(result.status, "unavailable")
-  assert.equal(result.defaults, undefined)
+  const partial = routing.loadBuiltinRouting(h.env)
+  assert.equal(partial.status, "loaded", partial.reason)
+  assert.deepEqual(Object.keys(partial.defaults.unavailable).sort(), ["agents", "categories"])
+  assert.deepEqual(partial.defaults.categories, {})
+  assert.deepEqual(partial.defaults.agents, {})
+  assert.deepEqual(Object.keys(partial.defaults.model_profiles).sort(), ["capable", "deep-work"])
+  writeFileSync(join(h.extensions, "omo.js"), "export const unrelated = {}")
+  const none = routing.loadBuiltinRouting(h.env)
+  assert.equal(none.status, "unavailable")
+  assert.equal(none.defaults, undefined)
+})
+
+test("a table that cannot be read marks only its own rows 확인 불가 and names the section", async t => {
+  const h = fixture(t, { model_profile: "capable", categories: { quick: { models: ["custom/model"] } } })
+  writeFileSync(join(h.extensions, "omo-task.js"), TASK_SOURCE.replace('model:"fast"', "model:fast()"))
+  await h.run()
+  const report = h.reports.at(-1).message
+  assert.match(report, /^warning: builtin category chains unavailable; those rows show configured chains only \(.*non-constant/m)
+  assert.match(report, /^quick\s.*확인 불가$/m)
+  assert.equal(row(report, "explore"), "four/search")
+  assert.match(report, /^main \(capable\)\s.*기본$/m)
 })
 
 test("tables are recognised by shape, so a renamed category (deep -> deep-low/deep-high) keeps builtin defaults loading", async t => {
@@ -79,17 +98,53 @@ test("main profiles are read by shape: extra leading fields and spread provider 
   assert.equal(result.defaults.descriptions.model_profiles.capable, "General")
 })
 
+test("main profiles are read with JS semantics: minified booleans, void 0 and a leading entry (2026-09-24 beta.89 bundle)", t => {
+  const h = fixture(t)
+  writeFileSync(join(h.extensions, "omo.js"), `var c8=["six","seven"],u8=["eight"],p8=Object.freeze({recommended:{displayName:"Recommended",description:"Best connected.",rankedProvidersOnly:!0,models:[{providers:[...c8],model:"main",variant:"medium"},{providers:[...u8],model:"alt",variant:void 0}]},capable:{family:"daily",tier:"normal",displayName:"Capable",models:[{providers:[...c8],model:"main",variant:"max"}]}});throw new Error("must never execute installed source");`)
+  const result = routing.loadBuiltinRouting(h.env)
+  assert.equal(result.status, "loaded", result.reason)
+  assert.deepEqual(result.defaults.unavailable, {})
+  assert.deepEqual(result.defaults.model_profiles.recommended, [
+    { providers: ["six", "seven"], model: "main", variant: "medium" },
+    { providers: ["eight"], model: "alt" },
+  ])
+  assert.deepEqual(Object.keys(result.defaults.model_profiles), ["recommended", "capable"])
+})
+
 test("a spread without exactly one literal array definition is unsupported, not guessed", t => {
   const h = fixture(t)
   const table = `var q={capable:{displayName:"Capable",models:[{providers:[...p1],model:"main"}]}};`
   for (const definitions of ["", `var p1=["six"];function f(){var p1=["other"]}`, "var p1=g();"]) {
     writeFileSync(join(h.extensions, "omo.js"), definitions + table)
-    assert.equal(routing.loadBuiltinRouting(h.env).status, "unavailable", definitions || "no definition")
+    const result = routing.loadBuiltinRouting(h.env)
+    assert.match(result.defaults.unavailable.model_profiles ?? "", /\.\.\.p1/, definitions || "no definition")
+    assert.deepEqual(result.defaults.model_profiles, {})
   }
 })
 
 test("source discovery requires a known installed launcher and never guesses another installation", () => {
   assert.equal(routing.loadBuiltinRouting({}).status, "unavailable")
+})
+
+test("without the @babel/parser installed with OMO nothing is claimed", t => {
+  const home = mkdtempSync(join(tmpdir(), "routing-no-parser-"))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  mkdirSync(join(home, "plugin", "extensions"), { recursive: true })
+  writeFileSync(join(home, "plugin", "extensions", "omo-task.js"), TASK_SOURCE)
+  writeFileSync(join(home, "plugin", "extensions", "omo.js"), MAIN_SOURCE)
+  const result = routing.loadBuiltinRouting({ OMO_BIN: join(home, "bin", "omo.js") })
+  assert.equal(result.status, "unavailable")
+  assert.match(result.reason, /@babel\/parser/)
+})
+
+// Upgrade detector: the bundles of the omo-ai install running these tests.
+test("the installed OMO bundles yield every builtin section", () => {
+  assert.ok(process.env.OMO_BIN, "run the tests inside omo (OMO_BIN) to check the installed bundles")
+  const result = routing.loadBuiltinRouting(process.env)
+  assert.equal(result.status, "loaded", result.reason)
+  assert.deepEqual(result.defaults.unavailable, {})
+  for (const section of ["categories", "agents", "model_profiles"])
+    assert.ok(Object.keys(result.defaults[section]).length > 0, `no builtin ${section}`)
 })
 
 test("partial config uses builtin chains for metadata-only and empty categories and agents", t => {
@@ -160,13 +215,20 @@ test("builtin category primary precedes the fallback table, including fallback_m
 test("unsupported expressions in default tables are never executed", t => {
   const h = fixture(t)
   writeFileSync(join(h.extensions, "omo-task.js"), TASK_SOURCE.replace('model:"fast"', 'model:(()=>{throw new Error("executed")})()'))
-  assert.equal(routing.loadBuiltinRouting(h.env).status, "unavailable")
+  const result = routing.loadBuiltinRouting(h.env)
+  // Rejected before evaluation: running it would report "executed" instead.
+  assert.match(result.defaults.unavailable.categories ?? "", /non-constant/)
+  assert.deepEqual(result.defaults.categories, {})
+  assert.deepEqual(Object.keys(result.defaults.agents).sort(), ["explore", "librarian"])
 })
 
 test("duplicate recognizable tables are ambiguous rather than chosen by file order", t => {
   const h = fixture(t)
   writeFileSync(join(h.extensions, "omo-task.js"), TASK_SOURCE + TASK_SOURCE)
-  assert.equal(routing.loadBuiltinRouting(h.env).status, "unavailable")
+  const result = routing.loadBuiltinRouting(h.env)
+  assert.match(result.defaults.unavailable.categories ?? "", /found 2/)
+  assert.match(result.defaults.unavailable.agents ?? "", /found 2/)
+  assert.deepEqual(Object.keys(result.defaults.model_profiles).sort(), ["capable", "deep-work"])
 })
 
 test("disabled entries never present their chain as active", t => {

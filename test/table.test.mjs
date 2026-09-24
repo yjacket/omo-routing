@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createRouting } from "../extension/routing.ts"
+import { fixtureDir } from "./fixture-dir.mjs"
 
 // Data-only extracts shaped like the installed OMO bundles: chain tables plus the
 // category/agent/profile definitions that carry the builtin role descriptions.
@@ -19,7 +20,7 @@ const TASK_SOURCE = [
 const MAIN_SOURCE = `var profiles={capable:{displayName:"Capable",description:"Strongest generalist.",models:[{providers:["six","seven"],model:"main",variant:"max"}]},"deep-work":{displayName:"Deep",description:"Hard problems.",models:[{providers:["eight"],model:"reason"}]}};throw new Error("must never execute installed source");`
 
 function fixture(t, config, { builtins = true } = {}) {
-  const home = mkdtempSync(join(tmpdir(), "routing-table-"))
+  const home = builtins ? fixtureDir("routing-table-") : mkdtempSync(join(tmpdir(), "routing-table-"))
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const extensions = join(home, "installed omo", "plugin", "extensions")
   mkdirSync(extensions, { recursive: true })

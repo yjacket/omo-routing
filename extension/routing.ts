@@ -32,6 +32,9 @@
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, userInfo } from "node:os"
+import { createHash } from "node:crypto"
+import { createRequire } from "node:module"
+import { createContext, runInContext } from "node:vm"
 
 export type Deps = { env?: Record<string, string | undefined>; home?: string }
 
@@ -129,6 +132,7 @@ export function applyProfile(raw: any, profile: string | undefined): { config: a
 }
 
 type BuiltinRung = { providers: string[]; model: string; variant?: string }
+type BuiltinSection = "categories" | "agents" | "model_profiles"
 type BuiltinDefaults = {
   categories: Record<string, BuiltinRung[]>
   agents: Record<string, BuiltinRung[]>
@@ -136,6 +140,9 @@ type BuiltinDefaults = {
   agentCategories: Record<string, string[]>
   categoryModels: Record<string, string>
   descriptions: { categories: Record<string, string>; agents: Record<string, string>; model_profiles: Record<string, string> }
+  /** Sections whose installed table could not be read, with the reason. Their
+   * rows show configured chains only; the other sections still load. */
+  unavailable: Partial<Record<BuiltinSection, string>>
 }
 export type BuiltinRouting =
   | { status: "loaded"; defaults: BuiltinDefaults; source: string }
@@ -146,141 +153,290 @@ const record = (value: unknown): value is Record<string, unknown> =>
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(v => typeof v === "string")
 const rungs = (value: unknown): value is BuiltinRung[] => Array.isArray(value) && value.length > 0 && value.every(v =>
   record(v) && strings(v.providers) && v.providers.length > 0 && typeof v.model === "string" && (v.variant === undefined || typeof v.variant === "string"))
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error)
 
-/** Read only JSON-like literal data, never import/eval the host's executable bundles.
- * OMO's shipped tables use quoted strings and unquoted property names, and share
- * provider lists through array spreads (`providers:[...a8]`). A spread is read
- * from its literal `name=[...]` definition in the same bundle, never evaluated.
- * Any other expression (calls, references, object spreads, etc.) is unsupported.
- */
-function sourceLiteral(source: string, start: number, spreadDepth = 2): unknown {
-  const token = /\s*("(?:\\.|[^"\\])*"|\.\.\.[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*|-?\d+(?:\.\d+)?|[{}[\]:,])/y
-  let cursor = start
-  const open: string[] = []
-  let json = ""
-  do {
-    token.lastIndex = cursor
-    const match = token.exec(source)
-    if (!match) return undefined
-    const text = match[1]
-    cursor = token.lastIndex
-    if (text === "{" || text === "[") open.push(text)
-    if (text === "}" || text === "]") open.pop()
-    if (text.startsWith("...")) {
-      const items = open.at(-1) === "[" && spreadDepth > 0 ? spreadArray(source, text.slice(3), spreadDepth - 1) : undefined
-      if (!items?.length) return undefined
-      json += JSON.stringify(items).slice(1, -1)
-    } else if (/^[A-Za-z_$]/.test(text)) {
-      if (/^\s*:/.test(source.slice(cursor))) json += JSON.stringify(text)
-      else if (["true", "false", "null"].includes(text)) json += text
-      else return undefined
-    } else json += text
-  } while (open.length > 0)
-  try { return JSON.parse(json) } catch (error) {
-    if (error instanceof SyntaxError) return undefined
-    throw error
+// OMO's builtin chains are constants inside its minified bundles, and none of its
+// exports or runtime hooks hand them out. The bundles are parsed with the
+// @babel/parser that omo-ai itself installs, so JS syntax (`!0`, spreads, quoting,
+// field order) is read by a JS parser, not a hand-written tokenizer. Tables are
+// recognized by AST shape, never by minifier names or category names, and only
+// constant data is evaluated.
+
+type AstNode = { type: string; start: number; end: number; [key: string]: any }
+type Bundle = {
+  file: string
+  source: string
+  chainTables: AstNode[]
+  profileTables: AstNode[]
+  /** Objects with a string `name`: category and agent definitions among others. */
+  definitions: AstNode[]
+  /** `name=[...]` array literals (declarations or assignments): spread sources. */
+  arrays: Map<string, AstNode[]>
+  context: Record<string, unknown>
+}
+
+/** An installed bundle without the expected shape; its sections are reported
+ * unavailable rather than guessed. */
+class UnsupportedBundle extends Error {}
+
+const keyOf = (property: AstNode): string | undefined =>
+  property.type !== "ObjectProperty" || property.computed ? undefined
+    : property.key.type === "Identifier" ? property.key.name
+      : property.key.type === "StringLiteral" ? property.key.value : undefined
+const propertyOf = (node: AstNode, key: string): AstNode | undefined =>
+  node.properties.find((property: AstNode) => keyOf(property) === key)?.value
+const keysOf = (node: AstNode): (string | undefined)[] => node.properties.map(keyOf)
+const isRung = (node: AstNode | null): boolean => node?.type === "ObjectExpression"
+  && propertyOf(node, "providers") !== undefined && propertyOf(node, "model") !== undefined
+const isChain = (node: AstNode | undefined): boolean =>
+  node?.type === "ArrayExpression" && node.elements.length > 0 && node.elements.every(isRung)
+const isTableOf = (node: AstNode, entry: (value: AstNode) => boolean): boolean => node.type === "ObjectExpression"
+  && node.properties.length > 0 && node.properties.every((property: AstNode) => keyOf(property) !== undefined && entry(property.value))
+const isProfile = (node: AstNode): boolean => node.type === "ObjectExpression" && isChain(propertyOf(node, "models"))
+const isAgentTable = (node: AstNode): boolean => ["explore", "librarian"].every(name => keysOf(node).includes(name))
+
+const CONSTANT_UNARY = new Set(["!", "-", "+", "~", "void"])
+/** Constant data only: literals, operators over constants, arrays, plain
+ * objects, and array spreads of a named array (collected into `spreads`).
+ * Calls, functions, member access and every other reference are rejected
+ * before anything is evaluated. */
+function isConstant(node: AstNode | null, spreads: Set<string>): boolean {
+  if (node === null) return true // array hole
+  switch (node.type) {
+    case "StringLiteral": case "NumericLiteral": case "BooleanLiteral": case "NullLiteral": case "BigIntLiteral":
+      return true
+    case "TemplateLiteral":
+      return node.expressions.every((expression: AstNode) => isConstant(expression, spreads))
+    case "UnaryExpression":
+      return CONSTANT_UNARY.has(node.operator) && isConstant(node.argument, spreads)
+    case "BinaryExpression":
+      return node.operator !== "in" && node.operator !== "instanceof" && isConstant(node.left, spreads) && isConstant(node.right, spreads)
+    case "LogicalExpression":
+      return isConstant(node.left, spreads) && isConstant(node.right, spreads)
+    case "ConditionalExpression":
+      return [node.test, node.consequent, node.alternate].every(part => isConstant(part, spreads))
+    case "ArrayExpression":
+      return node.elements.every((element: AstNode | null) => {
+        if (element?.type !== "SpreadElement") return isConstant(element, spreads)
+        if (element.argument.type !== "Identifier") return false
+        spreads.add(element.argument.name)
+        return true
+      })
+    case "ObjectExpression":
+      return node.properties.every((property: AstNode) => keyOf(property) !== undefined && isConstant(property.value, spreads))
+    default:
+      return false
   }
 }
 
-/** Elements behind `...name`: every `name=[...]` literal in the bundle must be
- * the same array. Minifiers reuse short names across scopes, so conflicting or
- * missing definitions are unsupported rather than guessed. */
-function spreadArray(source: string, name: string, spreadDepth: number): unknown[] | undefined {
-  const definition = new RegExp(`(?<![\\w$.])${name.replace(/\$/g, "\\$")}\\s*=(?!=)\\s*(?=\\[)`, "g")
-  const values = [...source.matchAll(definition)].map(match => sourceLiteral(source, match.index + match[0].length, spreadDepth))
-  if (!values.length || !values.every(Array.isArray)) return undefined
-  const first = JSON.stringify(values[0])
-  return values.every(value => JSON.stringify(value) === first) ? values[0] as unknown[] : undefined
-}
-
-/** Decode one quoted literal from the bundle; OMO ships both '…' and "…" strings. */
-function sourceString(raw: string): string | undefined {
-  const json = raw.startsWith('"') ? raw : `"${raw.slice(1, -1).replace(/\\'/g, "'").replace(/(^|[^\\])"/g, '$1\\"')}"`
+/** The value of a constant-data node. A spread `...name` reads the array literal
+ * bound to `name` in the same bundle; minifiers reuse short names across scopes,
+ * so every such literal must be the same array, and none or several different
+ * ones are unsupported rather than guessed. */
+function evaluate(bundle: Bundle, node: AstNode, spreadDepth = 2): unknown {
+  const spreads = new Set<string>()
+  if (!isConstant(node, spreads))
+    throw new UnsupportedBundle(`${bundle.file}: non-constant expression in builtin data at offset ${node.start}`)
+  for (const name of spreads) {
+    const definitions = bundle.arrays.get(name) ?? []
+    if (!definitions.length) throw new UnsupportedBundle(`${bundle.file}: no array literal defines ...${name}`)
+    if (spreadDepth === 0) throw new UnsupportedBundle(`${bundle.file}: ...${name} is nested too deeply`)
+    const values = new Set(definitions.map(definition => JSON.stringify(evaluate(bundle, definition, spreadDepth - 1))))
+    if (values.size !== 1) throw new UnsupportedBundle(`${bundle.file}: conflicting array literals define ...${name}`)
+    bundle.context[name] = JSON.parse([...values][0])
+  }
+  // Constant data cannot run code; the VM only supplies JS semantics, and the
+  // result is copied out of its realm.
+  let value: unknown
   try {
-    const value = JSON.parse(json)
-    return typeof value === "string" ? value : undefined
+    value = runInContext(`(${bundle.source.slice(node.start, node.end)})`, bundle.context, { timeout: 100 })
   } catch (error) {
-    if (error instanceof SyntaxError) return undefined
-    throw error
+    throw new UnsupportedBundle(`${bundle.file}: cannot evaluate builtin data at offset ${node.start}: ${errorText(error)}`)
   }
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
 }
 
-const SOURCE_STRING = `("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`
+/** A constant string property, or undefined when absent or not constant data. */
+function textOf(bundle: Bundle, node: AstNode, key: string): string | undefined {
+  const value = propertyOf(node, key)
+  if (value === undefined || !isConstant(value, new Set())) return undefined
+  const text = evaluate(bundle, value)
+  return typeof text === "string" ? text : undefined
+}
 
-function builtinTables(source: string, main: boolean): Record<string, unknown>[] {
-  // The discriminator is the data shape, not minifier-generated variable names
-  // or field order: a main profile is any object whose first entry carries a
-  // `models` rung list (OMO added `family`/`tier` ahead of `displayName`).
-  const pattern = main
-    ? /\{\s*(?:"[^"\\]+"|[\w$]+)\s*:\s*\{[^{}]*?\bmodels\s*:\s*\[\s*\{\s*providers\s*:/g
-    : /\{\s*(?:"[^"\\]+"|[\w$]+)\s*:\s*\[\s*\{\s*providers\s*:/g
-  return [...source.matchAll(pattern)].flatMap(match => {
-    const value = sourceLiteral(source, match.index)
-    return record(value) ? [value] : []
+function parseBundle(file: string, source: string, parse: (source: string) => AstNode): Bundle | UnsupportedBundle {
+  let program: AstNode
+  try {
+    program = parse(source)
+  } catch (error) {
+    return new UnsupportedBundle(`cannot parse ${file}: ${errorText(error)}`)
+  }
+  const bundle: Bundle = {
+    file, source, chainTables: [], profileTables: [], definitions: [], arrays: new Map(),
+    context: createContext(Object.create(null)),
+  }
+  const stack = [program]
+  while (stack.length) {
+    const node = stack.pop() as AstNode
+    const [target, value] = node.type === "VariableDeclarator" ? [node.id, node.init]
+      : node.type === "AssignmentExpression" && node.operator === "=" ? [node.left, node.right] : []
+    if (target?.type === "Identifier" && value?.type === "ArrayExpression")
+      bundle.arrays.set(target.name, [...(bundle.arrays.get(target.name) ?? []), value])
+    if (node.type === "ObjectExpression") {
+      if (isTableOf(node, isChain)) bundle.chainTables.push(node)
+      else if (isTableOf(node, isProfile)) bundle.profileTables.push(node)
+      else if (propertyOf(node, "name")?.type === "StringLiteral") bundle.definitions.push(node)
+    }
+    for (const child of Object.values(node))
+      for (const item of Array.isArray(child) ? child : [child])
+        if (item !== null && typeof item === "object" && typeof item.type === "string") stack.push(item)
+  }
+  return bundle
+}
+
+/** The one table of a kind; none or several are unsupported, never chosen by file order. */
+function onlyTable(bundle: Bundle, tables: AstNode[], kind: string): Record<string, unknown> {
+  if (tables.length !== 1) throw new UnsupportedBundle(`${bundle.file}: expected one builtin ${kind} table, found ${tables.length}`)
+  return evaluate(bundle, tables[0]) as Record<string, unknown>
+}
+
+function chainTable(bundle: Bundle, tables: AstNode[], kind: string): Record<string, BuiltinRung[]> {
+  const table = onlyTable(bundle, tables, kind)
+  for (const [name, chain] of Object.entries(table))
+    if (!rungs(chain)) throw new UnsupportedBundle(`${bundle.file}: unsupported builtin ${kind} chain ${name}`)
+  return table as Record<string, BuiltinRung[]>
+}
+
+function readCategories(bundle: Bundle, defaults: BuiltinDefaults): void {
+  // Category definitions carry the preferred model that precedes the fallback table.
+  const definitions = bundle.definitions.filter(node => {
+    const config = propertyOf(node, "config")
+    return config?.type === "ObjectExpression" && propertyOf(config, "model") !== undefined
   })
+  const names = definitions.map(node => (propertyOf(node, "name") as AstNode).value as string)
+  // Tables are told apart by shape, never by a particular category name: OMO
+  // renames categories (deep -> deep-low/deep-high).
+  const categories = chainTable(bundle, bundle.chainTables.filter(node => !isAgentTable(node)
+    && (!names.length || keysOf(node).some(name => name !== undefined && names.includes(name)))), "category")
+  const categoryModels: Record<string, string> = {}
+  const descriptions: Record<string, string> = {}
+  for (const node of definitions) {
+    const name = (propertyOf(node, "name") as AstNode).value as string
+    const config = propertyOf(node, "config") as AstNode
+    const model = textOf(bundle, config, "model")
+    if (model === undefined) throw new UnsupportedBundle(`${bundle.file}: unsupported default model for category ${name}`)
+    const variant = textOf(bundle, config, "variant")
+    categoryModels[name] = variant === undefined ? model : `${model}:${variant}`
+    // Role descriptions are context, never routing data: an absent or unreadable
+    // description leaves the cell empty instead of inventing one.
+    const description = textOf(bundle, node, "description")
+    if (description) descriptions[name] = description
+  }
+  defaults.categories = categories
+  defaults.categoryModels = categoryModels
+  defaults.descriptions.categories = descriptions
 }
+
+function readAgents(bundle: Bundle, defaults: BuiltinDefaults): void {
+  const agents = chainTable(bundle, bundle.chainTables.filter(isAgentTable), "agent")
+  const agentCategories: Record<string, string[]> = {}
+  const descriptions: Record<string, string> = {}
+  for (const node of bundle.definitions) {
+    const name = (propertyOf(node, "name") as AstNode).value as string
+    if (propertyOf(node, "mode")?.value === "subagent") {
+      const description = textOf(bundle, node, "description")
+      if (description) descriptions[name] = description
+    }
+    // Some builtin agents route through categories rather than their own table.
+    const categories = propertyOf(node, "categories")
+    if (categories?.type !== "ArrayExpression") continue
+    const value = evaluate(bundle, categories)
+    if (!strings(value)) throw new UnsupportedBundle(`${bundle.file}: unsupported categories for agent ${name}`)
+    agentCategories[name] = value
+  }
+  defaults.agents = agents
+  defaults.agentCategories = agentCategories
+  defaults.descriptions.agents = descriptions
+}
+
+function readProfiles(bundle: Bundle, defaults: BuiltinDefaults): void {
+  const profiles: Record<string, BuiltinRung[]> = {}
+  const descriptions: Record<string, string> = {}
+  for (const [name, entry] of Object.entries(onlyTable(bundle, bundle.profileTables, "main model profile"))) {
+    if (!record(entry) || !rungs(entry.models)) throw new UnsupportedBundle(`${bundle.file}: unsupported builtin main model profile ${name}`)
+    profiles[name] = entry.models
+    const label = [entry.description, entry.displayName].find(text => typeof text === "string" && text.trim())
+    if (typeof label === "string") descriptions[name] = label
+  }
+  defaults.model_profiles = profiles
+  defaults.descriptions.model_profiles = descriptions
+}
+
+/** The @babel/parser omo-ai installs (a declared dependency), resolved from the
+ * install root so the reader follows whatever syntax that OMO build emits. */
+function omoParser(root: string): (source: string) => AstNode {
+  const { parse } = createRequire(join(root, "package.json"))("@babel/parser")
+  return source => parse(source, { sourceType: "module" }).program
+}
+
+// Parsing the bundles takes a few hundred milliseconds, so the result is kept
+// until their contents change.
+let cached: { key: string; routing: BuiltinRouting } | undefined
 
 /** OMO's launcher exports OMO_BIN. Do not guess a different global installation. */
 export function loadBuiltinRouting(env: Record<string, string | undefined>): BuiltinRouting {
   if (!env.OMO_BIN) return { status: "unavailable", reason: "OMO_BIN is not set; installed OMO source cannot be located" }
-  const extensions = join(dirname(env.OMO_BIN), "..", "plugin", "extensions")
+  const root = join(dirname(env.OMO_BIN), "..")
+  const extensions = join(root, "plugin", "extensions")
+  const sources = new Map(["omo-task.js", "omo.js"].map(name => {
+    const file = join(extensions, name)
+    try {
+      return [name, readFileSync(file, "utf8")] as const
+    } catch (error) {
+      return [name, new UnsupportedBundle(`cannot read ${file}: ${errorText(error)}`)] as const
+    }
+  }))
+  const hash = createHash("sha256").update(root)
+  for (const source of sources.values()) hash.update("\0").update(typeof source === "string" ? source : source.message)
+  const key = hash.digest("hex")
+  if (cached?.key === key) return cached.routing
+
+  let parse: (source: string) => AstNode
   try {
-    const task = readFileSync(join(extensions, "omo-task.js"), "utf8")
-    const main = readFileSync(join(extensions, "omo.js"), "utf8")
-    // Tables are told apart by shape, never by a particular category name:
-    // OMO renames categories (deep -> deep-low/deep-high) and any name check
-    // would silently drop every builtin default on the next rename.
-    const tables = builtinTables(task, false).filter(t => Object.values(t).every(rungs))
-    const definedCategories = [...task.matchAll(/\{name:"([^"\\]+)",config:(\{)/g)].map(match => match[1])
-    const agentTables = tables.filter(t => rungs(t.explore) && rungs(t.librarian))
-    const categoryTables = tables.filter(t => !agentTables.includes(t)
-      && (!definedCategories.length || Object.keys(t).some(name => definedCategories.includes(name))))
-    const profileTables = builtinTables(main, true).filter(t => Object.values(t).every(v => record(v) && rungs(v.models)))
-    if (categoryTables.length !== 1 || agentTables.length !== 1 || profileTables.length !== 1)
-      return { status: "unavailable", reason: `unsupported or ambiguous builtin tables in ${extensions} (categories: ${categoryTables.length}, agents: ${agentTables.length}, model profiles: ${profileTables.length})` }
-    const defaults: BuiltinDefaults = {
-      categories: {}, agents: {}, model_profiles: {}, agentCategories: {}, categoryModels: {},
-      descriptions: { categories: {}, agents: {}, model_profiles: {} },
-    }
-    for (const [section, table] of [["categories", categoryTables[0]], ["agents", agentTables[0]], ["model_profiles", profileTables[0]]] as const) {
-      for (const [name, value] of Object.entries(table)) {
-        const chain = section === "model_profiles" && record(value) ? value.models : value
-        if (!rungs(chain)) return { status: "unavailable", reason: `unsupported builtin chain ${section}.${name} in ${extensions}` }
-        defaults[section][name] = chain
-        if (section === "model_profiles" && record(value)) {
-          const label = [value.description, value.displayName].find(text => typeof text === "string" && text.trim())
-          if (typeof label === "string") defaults.descriptions.model_profiles[name] = label
-        }
-      }
-    }
-    // Role descriptions are context, never routing data: an absent or unreadable
-    // description leaves the cell empty instead of inventing one.
-    for (const [pattern, section] of [
-      [new RegExp(`\\{name:"([^"\\\\]+)",config:\\{[^{}]*\\},description:${SOURCE_STRING}`, "g"), "categories"],
-      [new RegExp(`\\{name:"([^"\\\\]+)",description:${SOURCE_STRING},mode:"subagent"`, "g"), "agents"],
-    ] as const) {
-      for (const match of task.matchAll(pattern)) {
-        const text = sourceString(match[2])
-        if (text) defaults.descriptions[section][match[1]] = text
-      }
-    }
-    // Category definitions have a preferred model before their fallback table.
-    for (const match of task.matchAll(/\{name:"([^"\\]+)",config:(\{)/g)) {
-      const config = sourceLiteral(task, match.index + match[0].length - 1)
-      if (!record(config) || typeof config.model !== "string")
-        return { status: "unavailable", reason: `unsupported category default in ${extensions}` }
-      defaults.categoryModels[match[1]] = `${config.model}${typeof config.variant === "string" ? `:${config.variant}` : ""}`
-    }
-    // Some builtin agents route through categories rather than their own table.
-    for (const match of task.matchAll(/\{name:"([^"\\]+)",[^{}]*?categories:(\[[^\]]*\])/g)) {
-      const categories = sourceLiteral(match[2], 0)
-      if (!strings(categories)) return { status: "unavailable", reason: `unsupported agent categories in ${extensions}` }
-      defaults.agentCategories[match[1]] = categories
-    }
-    return { status: "loaded", defaults, source: extensions }
+    parse = omoParser(root)
   } catch (error) {
-    return { status: "unavailable", reason: `cannot read installed OMO source: ${error instanceof Error ? error.message : String(error)}` }
+    return { status: "unavailable", reason: `cannot load the @babel/parser installed with OMO in ${root}: ${errorText(error)}` }
   }
+  const bundles = new Map([...sources].map(([name, source]) =>
+    [name, typeof source === "string" ? parseBundle(join(extensions, name), source, parse) : source] as const))
+  const bundle = (name: string): Bundle => {
+    const value = bundles.get(name)
+    if (value instanceof UnsupportedBundle) throw value
+    return value as Bundle
+  }
+  const defaults: BuiltinDefaults = {
+    categories: {}, agents: {}, model_profiles: {}, agentCategories: {}, categoryModels: {},
+    descriptions: { categories: {}, agents: {}, model_profiles: {} }, unavailable: {},
+  }
+  // Each section stands alone: one unreadable table must not hide the others.
+  for (const [section, read] of [
+    ["categories", () => readCategories(bundle("omo-task.js"), defaults)],
+    ["agents", () => readAgents(bundle("omo-task.js"), defaults)],
+    ["model_profiles", () => readProfiles(bundle("omo.js"), defaults)],
+  ] as const) {
+    try {
+      read()
+    } catch (error) {
+      if (!(error instanceof UnsupportedBundle)) throw error
+      defaults.unavailable[section] = error.message
+    }
+  }
+  const failures = Object.values(defaults.unavailable)
+  const routing: BuiltinRouting = failures.length === 3
+    ? { status: "unavailable", reason: [...new Set(failures)].join("; ") }
+    : { status: "loaded", defaults, source: extensions }
+  cached = { key, routing }
+  return routing
 }
 
 const builtinModels = (chain: BuiltinRung[]): string[] => chain.flatMap(rung =>
@@ -630,8 +786,15 @@ function metadataLines(input: ReportInput, builtin: BuiltinRouting, resolved: Re
       ? `builtin defaults: ${configPath ? "loaded; used where routing falls back" : "in use"} (${builtin.source})`
       : `warning: builtin defaults unavailable; showing configured chains only (${builtin.reason})`,
   ]
+  if (builtin.status === "loaded")
+    for (const [section, reason] of Object.entries(builtin.defaults.unavailable))
+      lines.push(`warning: builtin ${SECTION_LABELS[section as BuiltinSection]} unavailable; those rows show configured chains only (${reason})`)
   if (warning) lines.push(`warning: ${warning}`)
   return lines
+}
+
+const SECTION_LABELS: Record<BuiltinSection, string> = {
+  categories: "category chains", agents: "agent chains", model_profiles: "main model profiles",
 }
 
 export function buildReport(input: ReportInput, width = 0): string[] {
@@ -643,10 +806,14 @@ export function buildReport(input: ReportInput, width = 0): string[] {
   const builtinDescriptions = builtin.status === "loaded" ? builtin.defaults.descriptions : undefined
   const lines = metadataLines(input, builtin, resolved)
 
+  // A section whose builtin table could not be read cannot be compared. Agents
+  // also inherit category routing, so they depend on the category table too.
+  const unreadable = (section: BuiltinSection): boolean => builtin.status !== "loaded"
+    || section in builtin.defaults.unavailable || (section === "agents" && "categories" in builtin.defaults.unavailable)
   // 변경여부 answers "does this route differently from OMO's builtin routing?",
   // not "is there a user config?": an override that reproduces the default is 기본.
   const status = (section: "categories" | "agents", name: string): string => {
-    if (!baseline) return "확인 불가"
+    if (!baseline || unreadable(section)) return "확인 불가"
     const base = routingKey(baseline, section, name)
     return base !== undefined && base === routingKey(resolved, section, name) ? "기본" : "변경"
   }
@@ -667,7 +834,7 @@ export function buildReport(input: ReportInput, width = 0): string[] {
     const source = pinned ? "configured pin" : resolved.sources.model_profiles[selection] ?? "unresolved"
     const profileEntry = pinned ? undefined : (resolved.config as any).model_profiles?.[selection]
     const base: string[] | undefined = (baseline?.config as any)?.model_profiles?.[selection]?.models
-    const mainStatus = !baseline ? "확인 불가"
+    const mainStatus = !baseline || (!pinned && unreadable("model_profiles")) ? "확인 불가"
       : !pinned && base && JSON.stringify(base) === JSON.stringify(profileEntry?.models ?? []) ? "기본" : "변경"
     entries.push({ label: "main:" }, { cells: [
       [`main (${selection})`],

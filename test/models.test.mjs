@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createRouting } from "../extension/routing.ts"
+import { fixtureDir } from "./fixture-dir.mjs"
 
 // Data-only extracts shaped like the installed OMO bundles.
 const TASK_SOURCE = [
@@ -33,7 +34,7 @@ const CONFIG = {
 }
 
 function fixture(t, config = CONFIG, { builtins = true, env = {}, widget = true } = {}) {
-  const home = mkdtempSync(join(tmpdir(), "routing-models-"))
+  const home = builtins ? fixtureDir("routing-models-") : mkdtempSync(join(tmpdir(), "routing-models-"))
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const extensions = join(home, "installed omo", "plugin", "extensions")
   mkdirSync(extensions, { recursive: true })

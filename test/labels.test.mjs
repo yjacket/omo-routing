@@ -1,13 +1,13 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { createRouting } from "../extension/routing.ts"
+import { fixtureDir } from "./fixture-dir.mjs"
 
 // Real command + widget factory, with both config and installed bundles isolated.
 function fixture(t, config) {
-  const home = mkdtempSync(join(tmpdir(), "routing-labels-"))
+  const home = fixtureDir("routing-labels-")
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const extensions = join(home, "plugin", "extensions")
   mkdirSync(extensions, { recursive: true })

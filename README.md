@@ -102,7 +102,11 @@ The report shows:
 - `user config:` — the file read, or an explicit absence notice.
 - `builtin defaults:` — the installed source path when loaded. Missing or
   unsupported source instead produces a warning and configured-only output;
-  the report never claims defaults are in use when discovery fails.
+  the report never claims defaults are in use when discovery fails. Category
+  chains, agent chains and main model profiles are read independently: a
+  section whose table cannot be read gets its own `warning: builtin ...
+  unavailable` line and configured-only rows, while the others keep their
+  builtin defaults.
 - `warning:` also identifies an environment-selected profile that does not
   exist (base shown instead).
 - `main (<name>)`, `categories:`, `agents:` — the selected main chain and
@@ -113,7 +117,9 @@ Each section uses a four-column table in this order:
 `변경여부` (changed from defaults). Long values wrap inside their cells.
 Change status compares the effective routing with OMO's builtin routing:
 `기본` means unchanged, `변경` means different, and `확인 불가` means
-builtin defaults could not be loaded. Merely having a user-configured entry
+the builtin defaults for that row's section could not be loaded (agent rows
+also when category chains could not, since agents inherit category routing).
+Merely having a user-configured entry
 does not count as a change; model order and effort are significant.
 Descriptions use configured `description`, then `display_name`, then the
 installed builtin role text, or `-` if absent. They are summarized to the
@@ -168,15 +174,22 @@ Config overlays follow `omo-task.js`:
 
 Builtin discovery uses the host launcher's `OMO_BIN` to locate
 `../plugin/extensions/omo-task.js` (categories, agents, category inheritance)
-and `omo.js` (main model profiles). Only literal data is read; the bundles are
-never imported or executed, and no model list is copied into this extension.
-The adapter recognizes the installed bundle's table shapes, not minified
-variable names or field order. A shared provider list spread into a rung
-(`providers:[...a8]`) is read from its literal `a8=[...]` definition in the
-same bundle; a spread with no such definition, or with conflicting ones, is
-unsupported. Missing files, unsupported expressions, or ambiguous tables
-produce a visible warning. Restart/reload the host after upgrading OMO so the
-source on disk and the running host agree.
+and `omo.js` (main model profiles). OMO exports neither these tables nor the
+functions that resolve them, so the bundles are parsed with the
+`@babel/parser` that omo-ai itself installs (resolved from the install root):
+a JS parser reads the minified syntax (`!0`, `void 0`, spreads, quoting), not
+a hand-written tokenizer. Tables are recognized by their AST shape, not by
+minified variable names, field order or category names. Only constant data is
+evaluated — literals, operators over them, arrays and plain objects — in a
+separate `vm` context; calls, functions and any other reference are rejected
+before evaluation. The bundles are never imported or run, and no model list is
+copied into this extension. A shared provider list spread into a rung
+(`providers:[...a8]`) is read from its array literal `a8=[...]` in the same
+bundle; a spread with no such literal, or with conflicting ones, is
+unsupported. The result is cached until the bundle contents change. Missing
+files, a missing parser, unsupported expressions, or ambiguous tables produce
+a visible warning for the affected section. Restart/reload the host after
+upgrading OMO so the source on disk and the running host agree.
 
 ## Install
 
@@ -204,7 +217,10 @@ node --test
 Node ≥ 22.6: tests are `.mjs` and import `extension/routing.ts` directly
 through Node's built-in type stripping. A fake `pi`/`ctx` harness supplies the
 command registry and a temp `$HOME` with a fixture `omo.jsonc`. No senpi, no
-LLM calls.
+LLM calls. Fixture installs borrow the `@babel/parser` of the omo-ai install
+that `OMO_BIN` points at, so run the tests inside omo (or set `OMO_BIN`); one
+test reads that install's bundles themselves, so an OMO upgrade that changes
+their shape fails it.
 
 ## Limits
 
@@ -213,9 +229,10 @@ LLM calls.
   model/provider IDs are taken as declared by OMO, before registry alias
   normalization; only the display labels above are shortened. Session/CLI model overrides and runtime retry filtering are
   not inferred from this report.
-- Builtins require the recognizable installed source layout and `OMO_BIN`.
-  Bare Senpi or a future incompatible bundle gets configured-only output with
-  a warning, not guessed defaults.
+- Builtins require `OMO_BIN`, the `@babel/parser` installed with omo-ai, and
+  recognizable table shapes. Bare Senpi or a future incompatible bundle gets
+  configured-only output with a warning for the affected sections, not
+  guessed defaults.
 - `set`/`add`/`remove` are the only writes, and they only touch the one
   `models` array (plus a sibling `model` key on `set`); provider state is never
   touched. `/routing profile <name>` switching is not offered: the profile is
