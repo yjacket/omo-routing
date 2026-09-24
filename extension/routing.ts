@@ -21,22 +21,30 @@
 //     <model>:  provider/model[:variant]
 //     --profile <name> / --base pick the layer written; default is the current
 //     profile's `[native]` section (base when no profile is set).
+//   /routing edit [--profile <name>|--base]   interactive editor (omo TUI only):
+//                       every routing node of the installed OMO with its builtin chain,
+//                       the base/profile overrides on top, rungs of providers this
+//                       session is not connected to hidden, builtin changes since the
+//                       last review flagged; edits are staged and saved together.
 //
 // Resolution mirrors omo-task.js: layers merge base -> [native] -> profile base
 // -> profile [native], where a layer without `[native]` uses its legacy
 // `[senpi]` section instead; objects deep-merge, arrays replace. Edits are applied to
 // the omo.jsonc text at byte offsets, so comments and formatting survive; a
-// copy of the previous file is kept as omo.jsonc.bak. Nothing is checked
-// against live provider state.
+// copy of the previous file is kept as omo.jsonc.bak. The reports check nothing
+// against live provider state; only the editor reads the session's connected
+// models (ctx.modelRegistry.getAvailable()) to hide and offer candidates.
 
-import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs"
-import { join, dirname } from "node:path"
+import { existsSync, readFileSync, writeFileSync, copyFileSync, lstatSync, mkdirSync } from "node:fs"
+import { join, dirname, resolve } from "node:path"
 import { homedir, userInfo } from "node:os"
 import { createHash } from "node:crypto"
 import { createRequire } from "node:module"
+import { pathToFileURL } from "node:url"
 import { createContext, runInContext } from "node:vm"
 
-export type Deps = { env?: Record<string, string | undefined>; home?: string }
+/** `cwd` is where OMO looks for project `.omo/omo.jsonc` files (default: ctx.cwd). */
+export type Deps = { env?: Record<string, string | undefined>; home?: string; cwd?: string }
 
 const SKIP_KEYS = new Set(["__proto__", "constructor", "prototype"])
 const HARNESS_KEYS = new Set(["[opencode]", "[native]", "[senpi]", "[codex]", "[omo]"])
@@ -520,8 +528,13 @@ export function chainOf(entry: any): string[] {
     .filter((s): s is string => typeof s === "string" && s.length > 0)
 }
 
+// OMO renamed the subscription providers in 2026-09 (openai-codex ->
+// chatgpt-subscription, claude-sdk-oauth -> anthropic-subscription); both
+// generations keep the approved short labels.
 const PROVIDER_LABELS: ReadonlyMap<string, string> = new Map([
-  ["openai-codex", "codex"], ["claude-sdk-oauth", "claude"], ["github-copilot", "gh"],
+  ["openai-codex", "codex"], ["chatgpt-subscription", "codex"],
+  ["claude-sdk-oauth", "claude"], ["anthropic-subscription", "claude"],
+  ["github-copilot", "gh"],
 ])
 // Single letters for the efforts that appear in chains; `minimal` and `auto`
 // keep their two-letter labels. `off` and `none` share a letter on screen but
@@ -770,6 +783,10 @@ export type ReportInput = {
   warning?: string
   builtin?: BuiltinRouting
   configPath?: string
+  /** Extra warnings, e.g. project configs that also set routing. */
+  notices?: string[]
+  /** Builtin changes since the last review in `/routing edit`; shown when nonempty. */
+  drift?: Drift
 }
 
 const suppliedBuiltin = (input: ReportInput): BuiltinRouting =>
@@ -790,6 +807,8 @@ function metadataLines(input: ReportInput, builtin: BuiltinRouting, resolved: Re
     for (const [section, reason] of Object.entries(builtin.defaults.unavailable))
       lines.push(`warning: builtin ${SECTION_LABELS[section as BuiltinSection]} unavailable; those rows show configured chains only (${reason})`)
   if (warning) lines.push(`warning: ${warning}`)
+  for (const notice of input.notices ?? []) lines.push(`warning: ${notice}`)
+  if (input.drift?.count) lines.push(driftLine(input.drift))
   return lines
 }
 
@@ -1124,7 +1143,12 @@ export const HELP_LINES = [
   "",
   "변경여부: 기본 = same routing as the OMO builtin default, 변경 = differs (chain, disable or inherited category),",
   "           확인 불가 = the installed builtin routing could not be read.",
-  "Display only: codex=openai-codex, claude=claude-sdk-oauth, gh=github-copilot; other providers unchanged.",
+  "/routing edit [--profile <p>|-p <p>|--base]   interactive editor in the omo TUI: builtin chains of the",
+  "                              installed OMO under your base/profile changes; unconnected providers hidden;",
+  "                              builtin changes since the last review flagged; keys are listed in its footer",
+  "",
+  "Display only: codex=chatgpt-subscription|openai-codex, claude=anthropic-subscription|claude-sdk-oauth,",
+  "              gh=github-copilot; other providers unchanged.",
   "Effort labels: X=max, E=xhigh, H=high, M=medium, L=low, O=off or none, mi=minimal, au=auto.",
   "Use canonical IDs for edits, not display labels; model names and unknown values stay unchanged.",
   "Edits touch only that `models` array in ~/.omo/omo.jsonc; the previous file is kept as omo.jsonc.bak.",
@@ -1134,7 +1158,7 @@ export type EditArgs = { verb: "set" | "prepend" | "add" | "remove"; target: str
 
 /** `/routing models [--profile <name>|-p <name>|--base]`: the layer to read.
  * Anything else is an error, since this view takes no other argument. */
-export function parseModelsArgs(words: readonly string[]): { profile?: string; base: boolean } | string {
+export function parseModelsArgs(words: readonly string[], form = "models"): { profile?: string; base: boolean } | string {
   let profile: string | undefined
   let base = false
   for (let i = 0; i < words.length; i++) {
@@ -1142,8 +1166,8 @@ export function parseModelsArgs(words: readonly string[]): { profile?: string; b
     if (word === "--base") base = true
     else if (word === "--profile" || word === "-p") {
       profile = words[++i]
-      if (!profile) return "/routing models --profile needs a name (see /routing help)"
-    } else return `"${word}" is not an option for /routing models; use --profile <name> or --base (see /routing help)`
+      if (!profile) return `/routing ${form} --profile needs a name (see /routing help)`
+    } else return `"${word}" is not an option for /routing ${form}; use --profile <name> or --base (see /routing help)`
   }
   return { profile, base }
 }
@@ -1220,6 +1244,1330 @@ export function applyChainEdit(verb: EditArgs["verb"], current: string[], models
   return current.filter((m) => !models.includes(m))
 }
 
+// ---------------------------------------------------------------------------
+// /routing edit: the interactive editor. The component and everything it uses
+// are exported and free of host imports, so the fake harness drives them.
+
+export type Section = "categories" | "agents" | "model_profiles"
+const SECTIONS: readonly Section[] = ["categories", "agents", "model_profiles"]
+/** The effort suffixes OMO understands on `provider/model:effort`. */
+const EFFORTS = new Set(["off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "auto"])
+
+export type Spec = { providers: string[]; model: string; effort?: string }
+
+/** Split `provider/model[:effort]` or a builtin `{a|b}/model[:effort]` group.
+ * The final `:x` is an effort only when x is a known effort, so model names
+ * such as `swe-2-high` keep their text. */
+export function splitSpec(spec: string): Spec | undefined {
+  const slash = spec.indexOf("/")
+  if (slash <= 0) return undefined
+  const group = spec.slice(0, slash)
+  const providers = group.startsWith("{") && group.endsWith("}") ? group.slice(1, -1).split("|") : [group]
+  const rest = spec.slice(slash + 1)
+  const colon = rest.lastIndexOf(":")
+  return colon > 0 && EFFORTS.has(rest.slice(colon + 1))
+    ? { providers, model: rest.slice(0, colon), effort: rest.slice(colon + 1) }
+    : { providers, model: rest }
+}
+
+export const joinSpec = (provider: string, model: string, effort?: string): string =>
+  `${provider}/${model}${effort ? `:${effort}` : ""}`
+
+const labelSpec = (spec: string): string => formatChain([spec])
+
+export type ModelInfo = { provider: string; id: string; name: string; reasoning: boolean; source: unknown }
+/** The models this session can run. `known: false` means the registry could not
+ * be read: nothing is hidden and nothing can be picked. */
+export type Availability = { known: boolean; providers: string[]; models: Map<string, ModelInfo>; reason?: string }
+
+/** Connected models from `ctx.modelRegistry.getAvailable()`, the list OMO
+ * filters builtin rungs with. Providers keep the registry's order. */
+export function availabilityOf(registry: any): Availability {
+  const unknown = (reason: string): Availability => ({ known: false, providers: [], models: new Map(), reason })
+  if (typeof registry?.getAvailable !== "function") return unknown("no model registry in this context")
+  let list: unknown
+  try {
+    list = registry.getAvailable()
+  } catch (error) {
+    return unknown(`the model registry failed: ${errorText(error)}`)
+  }
+  if (!Array.isArray(list)) return unknown("the model registry returned no model list")
+  const providers: string[] = []
+  const models = new Map<string, ModelInfo>()
+  for (const model of list) {
+    if (!record(model) || typeof model.provider !== "string" || typeof model.id !== "string") continue
+    if (!providers.includes(model.provider)) providers.push(model.provider)
+    models.set(`${model.provider}/${model.id}`, {
+      provider: model.provider, id: model.id,
+      name: typeof model.name === "string" && model.name ? model.name : model.id,
+      reasoning: model.reasoning === true, source: model,
+    })
+  }
+  return { known: true, providers, models }
+}
+
+export type RungView = { visible: boolean; connected: string[]; hidden: string[]; unknown: boolean }
+
+/** One candidate in this session: which of its providers are connected, and
+ * whether a connected provider lacks that model id. */
+export function rungView(spec: string, availability: Availability): RungView {
+  const parts = splitSpec(spec)
+  if (!parts || !availability.known) return { visible: true, connected: parts?.providers ?? [], hidden: [], unknown: false }
+  const connected = parts.providers.filter(provider => availability.providers.includes(provider))
+  return {
+    visible: connected.length > 0,
+    connected,
+    hidden: parts.providers.filter(provider => !connected.includes(provider)),
+    unknown: connected.length > 0 && !connected.some(provider => availability.models.has(`${provider}/${parts.model}`)),
+  }
+}
+
+/** A provider group narrowed to its connected providers, for display. */
+function connectedSpec(spec: string, view: RungView): string {
+  if (!view.hidden.length || !view.connected.length) return spec
+  const rest = spec.slice(spec.indexOf("/") + 1)
+  return `${view.connected.length === 1 ? view.connected[0] : `{${view.connected.join("|")}}`}/${rest}`
+}
+
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"]
+export type ThinkingLevelsOf = (model: unknown) => readonly string[] | undefined
+
+/** Efforts to offer for a model: the host's own `getSupportedThinkingLevels`
+ * when it could be loaded, else a conservative reading of the model metadata
+ * (xhigh/max only when the model's level map names them). An unknown model is
+ * offered every effort OMO accepts. */
+export function effortLevels(model: ModelInfo | undefined, host?: ThinkingLevelsOf): string[] {
+  if (!model) return ["off", ...THINKING_LEVELS]
+  try {
+    const levels = host?.(model.source)
+    if (Array.isArray(levels) && levels.length && levels.every(level => typeof level === "string")) return [...levels]
+  } catch {
+    // the metadata reading below still applies
+  }
+  if (!model.reasoning) return ["off"]
+  const map = (model.source as any)?.thinkingLevelMap
+  return THINKING_LEVELS.filter(level => !record(map)
+    ? level !== "xhigh" && level !== "max"
+    : map[level] !== null && (level !== "xhigh" && level !== "max" || map[level] !== undefined))
+}
+
+/** `getSupportedThinkingLevels` from the pi-ai copy the installed OMO runs,
+ * imported from its file (package exports are not assumed). */
+export async function hostThinkingLevels(env: Record<string, string | undefined>): Promise<ThinkingLevelsOf | undefined> {
+  if (!env.OMO_BIN) return undefined
+  const modules = join(dirname(env.OMO_BIN), "..", "node_modules")
+  const file = [join(modules, "@code-yeongyu", "senpi", "node_modules"), modules]
+    .map(dir => join(dir, "@earendil-works", "pi-ai", "dist", "models.js")).find(path => existsSync(path))
+  if (!file) return undefined
+  try {
+    const loaded = await import(pathToFileURL(file).href)
+    return typeof loaded.getSupportedThinkingLevels === "function" ? loaded.getSupportedThinkingLevels : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** One config layer: base (`profile` undefined) or one profile. */
+export type LayerRef = { profile?: string }
+
+const layerObject = (raw: any, layer: LayerRef): any => layer.profile === undefined ? raw : raw?.profiles?.[layer.profile]
+/** The harness section OMO applies for a layer, as applyProfile reads it. */
+function harnessKey(layer: any): string | undefined {
+  if (!isObj(layer)) return undefined
+  if (Object.hasOwn(layer, "[native]")) return isObj(layer["[native]"]) ? "[native]" : undefined
+  return isObj(layer["[senpi]"]) ? "[senpi]" : undefined
+}
+const pathValue = (value: any, path: readonly string[]): any =>
+  path.reduce((current, key) => (isObj(current) && Object.hasOwn(current, key) ? current[key] : undefined), value)
+const samePath = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((key, i) => key === b[i])
+
+/** Where a node lives in one layer: the locations defining it now (layer root,
+ * harness section) and the one a write targets, chosen like `/routing set`:
+ * the harness section, else the root when it already holds routing keys, else
+ * a new `[native]`. */
+function entryLocations(raw: any, layer: LayerRef, section: Section, name: string) {
+  const prefix = layer.profile === undefined ? [] : ["profiles", layer.profile]
+  const object = layerObject(raw, layer)
+  const key = harnessKey(object)
+  const root = [...prefix, section, name]
+  const harness = key ? [...prefix, key, section, name] : undefined
+  // A `[native]` that is present but not an object still hides `[senpi]` (OMO
+  // applies it as empty); a write replaces it with an object, never adds a twin key.
+  const blocked = key === undefined && isObj(object) && Object.hasOwn(object, "[native]")
+  const target = harness ?? (!blocked && ["categories", "agents", "model_profiles"].some(k => isObj(object?.[k]))
+    ? root : [...prefix, "[native]", section, name])
+  return {
+    target,
+    existing: [root, ...(harness ? [harness] : [])].filter(path => isObj(pathValue(raw, path))),
+    reset: blocked ? [...prefix, "[native]"] : undefined,
+  }
+}
+
+/** One layer's own entry for a node: its root definition merged with its harness section's. */
+export function layerEntry(raw: any, layer: LayerRef, section: Section, name: string): Record<string, any> | undefined {
+  const { existing } = entryLocations(raw, layer, section, name)
+  return existing.length ? existing.reduce((merged, path) => mergeConfig(merged, pathValue(raw, path)), {}) : undefined
+}
+
+/** What one layer sets for a node: its own chain (by OMO's rules for that
+ * section) and its `disable` flag; undefined when the layer does not name it. */
+export type Override = { chain?: string[]; disable?: boolean }
+export function overrideOf(section: Section, entry: Record<string, any> | undefined): Override | undefined {
+  if (!entry) return undefined
+  const chain = section === "categories"
+    ? Array.isArray(entry.models) && entry.models.length ? chainOf({ models: entry.models })
+      : chainOf({ model: entry.model, models: typeof entry.fallback_models === "string" ? [entry.fallback_models] : entry.fallback_models })
+    : section === "model_profiles" ? chainOf({ models: entry.models }) : chainOf(entry)
+  return {
+    ...(chain.length || (section === "model_profiles" && Array.isArray(entry.models)) ? { chain } : {}),
+    ...(typeof entry.disable === "boolean" ? { disable: entry.disable } : {}),
+  }
+}
+
+/** A staged change to one node in one layer. `chain`: the new candidates;
+ * `null` drops this layer's chain so the node follows base or OMO's builtin;
+ * absent leaves it. `disable`: true/false, or `null` to drop the key. */
+export type EditorDraft = { profile?: string; section: Section; name: string; chain?: string[] | null; disable: boolean | null }
+
+type EditOp = { remove: string[] } | { set: string[]; value: unknown }
+
+/** The edits one draft makes. The layer ends up with exactly the drafted
+ * routing: `model` and `fallback_models` go wherever the layer defines the node
+ * (they would precede or extend `models`); `models` stays only at the target. */
+function draftOps(raw: any, draft: EditorDraft): { ops: EditOp[]; prune: string[][] } {
+  const { target, existing, reset } = entryLocations(raw, { profile: draft.profile }, draft.section, draft.name)
+  const ops: EditOp[] = []
+  if (reset && ((Array.isArray(draft.chain) && draft.chain.length) || draft.disable !== null)) ops.push({ set: reset, value: {} })
+  const chain = Array.isArray(draft.chain) ? [...new Set(draft.chain)] : draft.chain
+  if (chain !== undefined) {
+    for (const path of existing) {
+      ops.push({ remove: [...path, "model"] }, { remove: [...path, "fallback_models"] })
+      if (!(chain?.length && samePath(path, target))) ops.push({ remove: [...path, "models"] })
+    }
+    if (chain?.length) ops.push({ set: [...target, "models"], value: chain })
+  }
+  for (const path of existing) if (draft.disable === null || !samePath(path, target)) ops.push({ remove: [...path, "disable"] })
+  if (draft.disable !== null) ops.push({ set: [...target, "disable"], value: draft.disable })
+  return { ops, prune: [...existing, target] }
+}
+
+const emptyObject = (value: unknown): boolean => isObj(value) && Object.keys(value as object).length === 0
+
+/** Apply drafts to omo.jsonc text in place: comments, key order and the style
+ * of untouched values survive, and an entry left empty is removed. */
+export function applyDrafts(src: string, drafts: readonly EditorDraft[]): string {
+  let text = src
+  for (const draft of drafts) {
+    const { ops, prune } = draftOps(parseJsonc(text), draft)
+    for (const op of ops) text = "remove" in op ? removeJsoncPath(text, op.remove) : setJsoncPath(text, op.set, op.value)
+    for (const path of prune) if (emptyObject(pathValue(parseJsonc(text), path))) text = removeJsoncPath(text, path)
+  }
+  return text
+}
+
+/** The same edits on a parsed config: what the editor shows before saving. */
+export function applyDraftsToConfig(raw: any, drafts: readonly EditorDraft[]): any {
+  const out = cloneValue(isObj(raw) ? raw : {})
+  const parentOf = (path: readonly string[], create: boolean): any => {
+    let current = out
+    for (const key of path.slice(0, -1)) {
+      if (!isObj(current[key])) {
+        if (!create) return undefined
+        current[key] = {}
+      }
+      current = current[key]
+    }
+    return current
+  }
+  for (const draft of drafts) {
+    const { ops, prune } = draftOps(out, draft)
+    for (const op of ops) {
+      if ("remove" in op) delete parentOf(op.remove, false)?.[op.remove[op.remove.length - 1]]
+      else parentOf(op.set, true)[op.set[op.set.length - 1]] = cloneValue(op.value)
+    }
+    for (const path of prune) if (emptyObject(pathValue(out, path))) delete parentOf(path, false)?.[path[path.length - 1]]
+  }
+  return out
+}
+
+export type SaveResult =
+  | { status: "saved"; text: string; count: number; backup?: string }
+  | { status: "external-change" }
+  | { status: "error"; message: string }
+
+/** Write drafts to the config file. `openedText` (the file as the editor read
+ * it) guards against silently overwriting an edit made meanwhile; the result
+ * must parse, the previous file is kept as `.bak`, a missing file is created. */
+export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean }): SaveResult {
+  const { path, openedText, drafts } = options
+  let current: string | undefined
+  try {
+    current = existsSync(path) ? readFileSync(path, "utf8") : undefined
+  } catch (error) {
+    return { status: "error", message: `cannot read ${path}: ${errorText(error)}` }
+  }
+  if (current !== openedText && !options.confirmExternal) return { status: "external-change" }
+  let next: string
+  try {
+    next = applyDrafts(current ?? "{\n}\n", drafts)
+    parseJsonc(next)
+  } catch (error) {
+    return { status: "error", message: `refusing to write ${path}: ${errorText(error)}` }
+  }
+  try {
+    if (current === undefined) mkdirSync(dirname(path), { recursive: true })
+    else copyFileSync(path, `${path}.bak`)
+    writeFileSync(path, next, "utf8")
+  } catch (error) {
+    return { status: "error", message: `cannot write ${path}: ${errorText(error)}` }
+  }
+  return { status: "saved", text: next, count: drafts.length, ...(current === undefined ? {} : { backup: `${path}.bak` }) }
+}
+
+export type EditorNode = {
+  section: Section
+  name: string
+  /** `section:name`; stable across edits. */
+  key: string
+  label: string
+  description: string
+  /** OMO's builtin chain for this node in the installed build, if it has one. */
+  builtin?: { display: string[]; models: string[] }
+  base?: Override
+  profile?: Override
+  effective: { display: string[]; models: string[]; source: string }
+  /** Absent from a readable builtin table: a node only the user defines. */
+  userOnly: boolean
+  readOnly?: string
+}
+
+/** Every routing node the editor lists: the selected main profile, then the
+ * categories and agents that are builtin or configured in either layer, each
+ * with its builtin chain, both layers' overrides and the effective chain. */
+export function editorNodes(input: { raw: any; profile?: string; builtin: BuiltinRouting }): EditorNode[] {
+  const { raw, profile, builtin } = input
+  const defaults = builtin.status === "loaded" ? builtin.defaults : undefined
+  const baseline = defaults ? resolveRouting({}, builtin) : undefined
+  const resolved = resolveRouting(applyProfile(raw, profile).config, builtin)
+  const node = (section: Section, name: string, label: string): EditorNode => {
+    const builtinDisplay = baseline && Object.hasOwn(baseline.display[section], name) ? baseline.display[section][name] : undefined
+    const configured = (resolved.config as any)[section]?.[name]
+    return {
+      section, name, key: `${section}:${name}`, label,
+      description: summarize(configured?.description ?? configured?.display_name ?? defaults?.descriptions[section][name], 160) || EMPTY_CELL,
+      ...(builtinDisplay ? { builtin: { display: builtinDisplay, models: (baseline?.config as any)[section]?.[name]?.models ?? [] } } : {}),
+      base: overrideOf(section, layerEntry(raw, {}, section, name)),
+      ...(profile === undefined ? {} : { profile: overrideOf(section, layerEntry(raw, { profile }, section, name)) }),
+      effective: { display: resolved.display[section][name] ?? [], models: configured?.models ?? [], source: resolved.sources[section][name] ?? "unresolved" },
+      userOnly: defaults !== undefined && !(section in defaults.unavailable) && !builtinDisplay,
+    }
+  }
+  const fixedMain = (text: string): EditorNode => ({
+    section: "model_profiles", name: "", key: "main", label: "main", description: EMPTY_CELL,
+    effective: { display: resolved.mainChain, models: [], source: "configured pin" }, userOnly: false, readOnly: text,
+  })
+  const selection = resolved.mainSelection
+  const nodes: EditorNode[] = [
+    !selection ? fixedMain("model_profile이 설정되지 않았습니다: 메인 세션은 OMO 기본 동작을 따릅니다 (이 편집기는 선택 자체는 바꾸지 않음)")
+      : selection.includes("/") ? fixedMain(`model_profile이 모델을 직접 고정합니다: ${selection}`)
+      : node("model_profiles", selection, `main (${selection})`),
+  ]
+  for (const section of ["categories", "agents"] as const)
+    for (const name of Object.keys(resolved.display[section]).sort()) nodes.push(node(section, name, name))
+  return nodes
+}
+
+/** The state word of a node while editing a layer (`profile` undefined = base). */
+export function nodeState(node: EditorNode, profile?: string): string {
+  if (node.readOnly) return "-"
+  if (node.effective.source === "disabled") return "비활성"
+  if ((profile === undefined ? node.base : node.profile)?.chain) return "커스텀"
+  if (profile !== undefined && node.base?.chain) return "base"
+  return node.builtin ? "빌트인" : "없음"
+}
+
+/** The chain an edit starts from in a layer: the layer's own chain when it has
+ * one, else what it inherits (base, then OMO's builtin) without the rungs of
+ * unconnected providers unless `showHidden`. */
+export function workingChain(node: EditorNode, profile: string | undefined, availability: Availability, showHidden: boolean): string[] {
+  const own = profile === undefined ? node.base : node.profile
+  // A category with only fallback_models runs builtin primary + those + builtin rungs.
+  const merged = node.effective.source === "configured + builtin"
+  if (own?.chain?.length && !merged) return [...own.chain]
+  const inherited = merged ? node.effective.models
+    : profile !== undefined && node.base?.chain?.length ? node.base.chain : node.builtin?.models ?? []
+  return showHidden ? [...inherited] : inherited.filter(spec => rungView(spec, availability).visible)
+}
+
+/** Problems in a candidate list: adjacent rungs that differ only in effort
+ * (limits are per account, so they are no fallback), ids the connected
+ * providers do not list, and a list with no connected candidate at all. */
+export function chainWarnings(chain: readonly string[], availability: Availability): string[] {
+  const out: string[] = []
+  chain.forEach((spec, index) => {
+    const here = splitSpec(spec)
+    const next = index + 1 < chain.length ? splitSpec(chain[index + 1]) : undefined
+    if (here && next && here.model === next.model && here.providers.join("|") === next.providers.join("|") && here.effort !== next.effort)
+      out.push(`${index + 1}·${index + 2}번: 같은 모델 ${here.model}의 effort만 다릅니다 (한도가 계정 단위라 폴백 효과가 없음)`)
+    if (rungView(spec, availability).unknown) out.push(`${index + 1}번: ${spec}은 연결된 모델 목록에 없습니다`)
+  })
+  if (chain.length && availability.known && !chain.some(spec => rungView(spec, availability).visible))
+    out.push("연결된 후보가 하나도 없어 이 노드는 실행되지 않습니다")
+  return out
+}
+
+/** Warnings for a node's effective chain; OMO's own builtin chains are only
+ * checked for having no connected candidate. */
+export function nodeWarnings(node: EditorNode, availability: Availability): string[] {
+  if (node.readOnly || node.effective.source === "disabled") return []
+  const warnings = chainWarnings(node.effective.models, availability)
+  return node.effective.source === "configured" || node.effective.source === "configured + builtin"
+    ? warnings : warnings.filter(warning => warning.startsWith("연결된 후보"))
+}
+
+/** The builtin routing a user last reviewed, kept beside omo.jsonc. */
+export type Snapshot = { version: 1; omo?: string; reviewedAt: string; sections: Partial<Record<Section, Record<string, string[]>>> }
+export type DriftEntry = { kind: "new" | "changed" | "removed"; before?: string[]; after?: string[] }
+export type Drift = { since?: string; count: number; sections: Partial<Record<Section, Record<string, DriftEntry>>> }
+
+export const snapshotPath = (home: string): string => join(home, ".omo", "routing-builtin-snapshot.json")
+
+/** The installed OMO version, from the package the launcher belongs to. */
+export function omoVersion(env: Record<string, string | undefined>): string | undefined {
+  if (!env.OMO_BIN) return undefined
+  try {
+    const version = JSON.parse(readFileSync(join(dirname(env.OMO_BIN), "..", "package.json"), "utf8")).version
+    return typeof version === "string" ? version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The installed builtin routing as display chains. Sections the loader could
+ * not read are left out, so they are never compared or overwritten. */
+export function builtinSnapshot(builtin: BuiltinRouting, omo?: string, now = new Date()): Snapshot {
+  const sections: Snapshot["sections"] = {}
+  if (builtin.status === "loaded") {
+    const { defaults } = builtin
+    const baseline = resolveRouting({}, builtin)
+    if (!("categories" in defaults.unavailable)) sections.categories = { ...baseline.display.categories }
+    if (!("agents" in defaults.unavailable)) {
+      const names = [...new Set([...Object.keys(defaults.agents), ...Object.keys(defaults.agentCategories)])].sort()
+      sections.agents = Object.fromEntries(names.map(name => [name, [
+        ...(defaults.agents[name] ? builtinDisplay(defaults.agents[name]) : []),
+        ...(defaults.agentCategories[name] ? [`categories: ${defaults.agentCategories[name].join(", ")}`] : []),
+      ]]))
+    }
+    if (!("model_profiles" in defaults.unavailable))
+      sections.model_profiles = Object.fromEntries(Object.entries(defaults.model_profiles).map(([name, chain]) => [name, builtinDisplay(chain)]))
+  }
+  return { version: 1, ...(omo ? { omo } : {}), reviewedAt: now.toISOString(), sections }
+}
+
+/** What changed between the reviewed snapshot and the installed build, for
+ * sections both could read. */
+export function snapshotDrift(reviewed: Snapshot, current: Snapshot): Drift {
+  const drift: Drift = { ...(reviewed.omo ? { since: reviewed.omo } : {}), count: 0, sections: {} }
+  for (const section of SECTIONS) {
+    const before = reviewed.sections[section]
+    const after = current.sections[section]
+    if (!before || !after) continue
+    const entries: Record<string, DriftEntry> = {}
+    for (const name of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      const a = Object.hasOwn(before, name) ? before[name] : undefined
+      const b = Object.hasOwn(after, name) ? after[name] : undefined
+      const kind = !a ? "new" : !b ? "removed" : JSON.stringify(a) !== JSON.stringify(b) ? "changed" : undefined
+      if (kind) entries[name] = { kind, ...(a ? { before: a } : {}), ...(b ? { after: b } : {}) }
+    }
+    if (Object.keys(entries).length) {
+      drift.sections[section] = entries
+      drift.count += Object.keys(entries).length
+    }
+  }
+  return drift
+}
+
+/** The new review baseline: the current build, keeping previously reviewed
+ * sections the current build could not read. */
+export const mergeSnapshot = (reviewed: Snapshot | undefined, current: Snapshot): Snapshot =>
+  ({ ...current, sections: { ...reviewed?.sections, ...current.sections } })
+
+/** The stored snapshot, or undefined when absent or not a snapshot. */
+export function readSnapshot(path: string): Snapshot | undefined {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8"))
+    if (!record(value) || value.version !== 1 || !record(value.sections)) return undefined
+    for (const [section, entries] of Object.entries(value.sections))
+      if (!SECTIONS.includes(section as Section) || !record(entries) || !Object.values(entries).every(strings)) return undefined
+    return value as Snapshot
+  } catch {
+    return undefined
+  }
+}
+
+export function writeSnapshot(path: string, snapshot: Snapshot): void {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8")
+}
+
+const driftName = (section: Section, name: string): string =>
+  section === "categories" ? name : section === "agents" ? `agent:${name}` : `main:${name}`
+const driftNames = (drift: Drift, kind: DriftEntry["kind"]): string[] =>
+  SECTIONS.flatMap(section => Object.entries(drift.sections[section] ?? {})
+    .filter(([, entry]) => entry.kind === kind).map(([name]) => driftName(section, name)))
+
+/** The report's one-line summary of builtin changes since the last review. */
+export function driftLine(drift: Drift): string {
+  const parts = (["new", "changed", "removed"] as const).flatMap(kind => {
+    const names = driftNames(drift, kind)
+    return names.length ? [`${kind} ${names.length} (${names.join(", ")})`] : []
+  })
+  return `builtin changes since last review${drift.since ? ` (reviewed on OMO ${drift.since})` : ""}: ${parts.join(", ")}; /routing edit to review`
+}
+
+export type ProjectConfig = { path: string; dir: string; problem?: string }
+
+const hasRouting = (config: any): boolean => isObj(config) && (
+  ["categories", "agents", "model_profile", "model_profiles"].some(key => Object.hasOwn(config, key))
+  || ["[native]", "[senpi]"].some(key => hasRouting(config[key]))
+  || (isObj(config.profiles) && Object.values(config.profiles).some(hasRouting)))
+
+const isLink = (path: string): boolean => {
+  try {
+    return lstatSync(path).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
+/** Project configs OMO also merges for sessions started in `cwd`: the
+ * `.omo/omo.jsonc` (else `omo.json`) of `cwd` and each parent up to, not
+ * including, `home`; symlinks are skipped as OMO skips them. Only files that
+ * set routing (or cannot be read) are returned. */
+export function projectConfigs(cwd: string, home: string): ProjectConfig[] {
+  const same = (a: string, b: string): boolean => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
+  const stop = resolve(home)
+  const found: ProjectConfig[] = []
+  let dir = resolve(cwd)
+  for (let depth = 0; depth < 256 && !same(dir, stop); depth++) {
+    const omo = join(dir, ".omo")
+    const file = isLink(omo) ? undefined : ["omo.jsonc", "omo.json"].map(name => join(omo, name)).find(path => {
+      try {
+        return lstatSync(path).isFile()
+      } catch {
+        return false
+      }
+    })
+    if (file) {
+      try {
+        if (hasRouting(parseJsonc(readFileSync(file, "utf8")))) found.push({ path: file, dir })
+      } catch (error) {
+        found.push({ path: file, dir, problem: errorText(error) })
+      }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return found
+}
+
+export const projectNotice = (config: ProjectConfig, korean = false): string => config.problem === undefined
+  ? korean ? `프로젝트 설정 ${config.path}도 라우팅을 정합니다: ${config.dir} 아래에서 시작한 세션에서는 이 설정이 ~/.omo/omo.jsonc 위에 덮입니다`
+    : `project config ${config.path} also sets routing; OMO merges it over ~/.omo/omo.jsonc in sessions started under ${config.dir}`
+  : korean ? `프로젝트 설정 ${config.path}을 읽지 못했습니다 (${config.problem}): 라우팅을 정한다면 OMO가 적용합니다`
+    : `project config ${config.path} could not be read (${config.problem}); if it sets routing, OMO applies it`
+
+const RAW_KEYS: Record<string, string> = {
+  "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+  "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left",
+  "\x1b[1;2A": "shift-up", "\x1b[1;2B": "shift-down",
+  "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
+  "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end",
+  "\r": "enter", "\n": "enter", "\x1b": "esc", "\t": "tab", "\x7f": "backspace", "\b": "backspace", "\x1b[3~": "delete",
+}
+const SELECT_BINDINGS = [
+  ["tui.select.up", "up"], ["tui.select.down", "down"], ["tui.select.pageUp", "pgup"],
+  ["tui.select.pageDown", "pgdn"], ["tui.select.confirm", "enter"], ["tui.select.cancel", "esc"],
+] as const
+const CSI_U_KEYS: Record<number, string> = { 8: "backspace", 9: "tab", 13: "enter", 27: "esc", 127: "backspace" }
+
+type KeyMatcher = { matches?(data: string, id: string): boolean }
+
+/** One key press as the editor names it (`up`, `enter`, `ch:a`, ...), from legacy,
+ * xterm or kitty (CSI u) sequences; the host's select keybindings count too.
+ * Printable keys held with ctrl/alt/super are ignored, never read as letters. */
+export function decodeKey(data: string, keybindings?: KeyMatcher): string | undefined {
+  if (Object.hasOwn(RAW_KEYS, data)) return RAW_KEYS[data]
+  const csi = data.startsWith("\x1b[") ? /^(\d+)(?::\d+)*(?:;(\d+)(?::\d+)*)?u$/.exec(data.slice(2)) : null
+  if (csi) {
+    const code = Number(csi[1])
+    const modifiers = Number(csi[2] ?? "1") - 1
+    if (CSI_U_KEYS[code]) return CSI_U_KEYS[code]
+    if (code < 32 || (modifiers & ~1) !== 0) return undefined
+    const char = String.fromCodePoint(code)
+    return `ch:${modifiers & 1 ? char.toUpperCase() : char}`
+  }
+  for (const [id, key] of SELECT_BINDINGS) {
+    try {
+      if (keybindings?.matches?.(data, id)) return key
+    } catch {
+      // a host without that binding id
+    }
+  }
+  return [...data].length === 1 && data >= " " ? `ch:${data}` : undefined
+}
+
+/** Exactly `width` terminal cells: padded with spaces, or cut with `…`. */
+export function fitCells(text: string, width: number): string {
+  if (width <= 0) return ""
+  const cells = displayWidth(text)
+  if (cells <= width) return text + " ".repeat(width - cells)
+  let out = ""
+  let used = 0
+  for (const { segment } of graphemes.segment(text)) {
+    const size = graphemeWidth(segment)
+    if (used + size > width - 1) break
+    out += segment
+    used += size
+  }
+  return `${out}…${" ".repeat(Math.max(0, width - used - 1))}`
+}
+const padCells = (text: string, width: number): string => text + " ".repeat(Math.max(0, width - displayWidth(text)))
+
+type Painter = { fg?(color: string, text: string): string; bold?(text: string): string }
+type Tone = "info" | "success" | "warning" | "error"
+type Confirm = "discard" | "external" | undefined
+type ChainMode = { kind: "chain"; key: string; cursor: number }
+type PickerMode = { kind: "picker"; key: string; rung: number; add: boolean; filter: string; pick: number }
+type EffortMode = { kind: "effort"; key: string; rung: number; action: "add" | "replace" | "effort"; provider: string; model: string; options: string[]; pick: number }
+type EditorMode = { kind: "list" } | ChainMode | PickerMode | EffortMode
+type Item = { text: string; color?: string; bold?: boolean; header?: boolean }
+
+const NO_EFFORT = "(없음)"
+const TONES: Record<Tone, string> = { info: "accent", success: "success", warning: "warning", error: "error" }
+/** Overlay placement for ctx.ui.custom; the component lays itself out to the same height. */
+export const EDITOR_OVERLAY = { width: "96%", maxHeight: "92%", minWidth: 40, margin: 1 } as const
+const draftKey = (profile: string | undefined, section: Section, name: string): string => `${profile ?? ""}\u0000${section}\u0000${name}`
+
+export type EditorOptions = {
+  /** The parsed config as opened (or `{}` when there is no file). */
+  raw: any
+  builtin: BuiltinRouting
+  availability: Availability
+  /** The profile layer, when one is edited besides base; the editor opens on it. */
+  profile?: string
+  omo?: string
+  drift?: Drift
+  warnings?: readonly string[]
+  configPath?: string
+  levels?: (model: ModelInfo | undefined) => string[]
+  save: (drafts: EditorDraft[], confirmExternal: boolean) => SaveResult
+  markReviewed?: () => Drift
+  done: (result: { saved: number }) => void
+  rows?: () => number
+  requestRender?: () => void
+}
+
+/** The `/routing edit` overlay: a pi-tui component (render/handleInput/
+ * invalidate). It never touches files itself: saving and marking the builtin
+ * reviewed go through the callbacks. */
+export class RoutingEditor {
+  private readonly options: EditorOptions
+  private readonly theme: Painter | undefined
+  private readonly keybindings: KeyMatcher | undefined
+  private raw: any
+  private readonly drafts = new Map<string, EditorDraft>()
+  private layer: string | undefined
+  private showHidden = false
+  private mode: EditorMode = { kind: "list" }
+  private cursor = 0
+  private readonly scrolls: Record<string, number> = {}
+  private listRows = 10
+  private message: { text: string; tone: Tone } | undefined
+  private confirm: Confirm
+  private saved = 0
+  private drift: Drift | undefined
+  private version = 0
+  private cache: { version: number; nodes: EditorNode[] } | undefined
+
+  constructor(options: EditorOptions, theme?: Painter, keybindings?: KeyMatcher) {
+    this.options = options
+    this.theme = theme
+    this.keybindings = keybindings
+    this.raw = isObj(options.raw) ? options.raw : {}
+    this.layer = options.profile
+    this.drift = options.drift
+  }
+
+  invalidate(): void {
+    this.cache = undefined
+  }
+
+  /** Staged drafts, in the order they were made. */
+  pending(): EditorDraft[] {
+    return [...this.drafts.values()]
+  }
+
+  handleInput(data: string): void {
+    const mode = this.mode
+    if (mode.kind === "picker" && [...data].length > 1 && [...data].every(char => char >= " " && char !== "\x7f")) {
+      mode.filter += data // pasted text
+      mode.pick = 0
+    } else {
+      const key = decodeKey(data, this.keybindings)
+      if (key !== undefined) this.dispatch(key)
+    }
+    this.options.requestRender?.()
+  }
+
+  private dispatch(key: string): void {
+    const confirm = this.confirm
+    this.confirm = undefined
+    this.message = undefined
+    const mode = this.mode
+    if (mode.kind === "list") this.listKey(key, confirm)
+    else if (mode.kind === "chain") this.chainKey(key, mode, confirm)
+    else if (mode.kind === "picker") this.pickerKey(key, mode)
+    else this.effortKey(key, mode)
+  }
+
+  private nodes(): EditorNode[] {
+    if (this.cache?.version === this.version) return this.cache.nodes
+    const raw = this.drafts.size ? applyDraftsToConfig(this.raw, this.pending()) : this.raw
+    const nodes = editorNodes({ raw, profile: this.options.profile, builtin: this.options.builtin })
+    this.cache = { version: this.version, nodes }
+    return nodes
+  }
+
+  private changed(): void {
+    this.version++
+    this.cache = undefined
+  }
+
+  private node(key: string): EditorNode | undefined {
+    return this.nodes().find(node => node.key === key)
+  }
+
+  private editChain(node: EditorNode): string[] {
+    return workingChain(node, this.layer, this.options.availability, this.showHidden)
+  }
+
+  /** Whether dropping this layer's chain leaves something to follow. */
+  private canFollow(node: EditorNode): boolean {
+    return node.builtin !== undefined || (this.layer !== undefined && !!node.base?.chain?.length)
+  }
+
+  private say(text: string, tone: Tone = "info"): void {
+    this.message = { text, tone }
+  }
+
+  private layerLabel(): string {
+    return this.layer === undefined ? "base" : `profile ${this.layer}`
+  }
+
+  private dirty(node: EditorNode): boolean {
+    return this.drafts.has(draftKey(undefined, node.section, node.name))
+      || (this.options.profile !== undefined && this.drafts.has(draftKey(this.options.profile, node.section, node.name)))
+  }
+
+  private driftOf(node: EditorNode): DriftEntry | undefined {
+    const entries = this.drift?.sections[node.section]
+    return entries && Object.hasOwn(entries, node.name) ? entries[node.name] : undefined
+  }
+
+  /** Stage a change for the current layer; a draft that ends up equal to what
+   * the layer already says is dropped. */
+  private stage(node: EditorNode, change: { chain?: string[] | null; disable?: boolean | null }): void {
+    const key = draftKey(this.layer, node.section, node.name)
+    const original = overrideOf(node.section, layerEntry(this.raw, { profile: this.layer }, node.section, node.name))
+    const draft: EditorDraft = {
+      ...(this.drafts.get(key) ?? {
+        ...(this.layer === undefined ? {} : { profile: this.layer }),
+        section: node.section, name: node.name, disable: original?.disable ?? null,
+      }),
+      ...change,
+    }
+    if (Array.isArray(draft.chain) && !draft.chain.length) draft.chain = null
+    const sameChain = draft.chain === undefined
+      || (draft.chain === null ? !original?.chain : JSON.stringify(draft.chain) === JSON.stringify(original?.chain))
+    if (sameChain && (draft.disable ?? undefined) === original?.disable) this.drafts.delete(key)
+    else this.drafts.set(key, draft)
+    this.changed()
+  }
+
+  private updateChain(node: EditorNode, next: string[]): boolean {
+    if (!next.length && !this.canFollow(node)) {
+      this.say("빌트인 기본값이 없는 노드라 마지막 모델은 지울 수 없습니다", "warning")
+      return false
+    }
+    this.stage(node, { chain: next.length ? next : null })
+    return true
+  }
+
+  private follow(node: EditorNode): void {
+    if (node.readOnly) {
+      this.say(node.readOnly, "warning")
+      return
+    }
+    if (!this.canFollow(node)) {
+      this.say("빌트인 기본값이 없는 노드라 따를 대상이 없습니다", "warning")
+      return
+    }
+    this.stage(node, { chain: null })
+    this.say(this.layer !== undefined && node.base?.chain?.length
+      ? `${node.label}: 이 레이어의 체인을 지웁니다, base 설정을 따릅니다`
+      : `${node.label}: 이 레이어의 체인을 지웁니다, OMO 빌트인 기본값을 따릅니다 (업데이트도 따라감)`)
+  }
+
+  private toggleDisable(node: EditorNode): void {
+    if (node.readOnly || node.section === "model_profiles") {
+      this.say("main은 비활성화할 수 없습니다", "warning")
+      return
+    }
+    const disabled = node.effective.source === "disabled"
+    if (disabled && this.layer === undefined && node.profile?.disable === true) {
+      this.say(`profile ${this.options.profile}에서 비활성화되어 있습니다: Tab으로 그 레이어로 가서 바꾸세요`, "warning")
+      return
+    }
+    const lower = this.layer !== undefined && node.base?.disable === true
+    this.stage(node, { disable: disabled ? (lower ? false : null) : true })
+    this.say(`${node.label}: ${disabled ? "다시 사용" : "비활성화"}`)
+  }
+
+  private undo(node: EditorNode): void {
+    if (!this.drafts.delete(draftKey(this.layer, node.section, node.name))) {
+      this.say("이 레이어에서 취소할 변경이 없습니다")
+      return
+    }
+    this.changed()
+    this.say(`${node.label}: ${this.layerLabel()} 변경을 취소했습니다`)
+  }
+
+  private toggleHidden(): void {
+    this.showHidden = !this.showHidden
+    this.say(`미연결 프로바이더 후보를 ${this.showHidden ? "표시합니다" : "숨깁니다"}`)
+  }
+
+  private switchLayer(): void {
+    if (this.options.profile === undefined) {
+      this.say("편집할 프로필이 없어 base만 편집합니다")
+      return
+    }
+    this.layer = this.layer === undefined ? this.options.profile : undefined
+    this.changed()
+    this.say(`편집 레이어: ${this.layerLabel()}`)
+  }
+
+  private markReviewed(): void {
+    if (!this.drift?.count || !this.options.markReviewed) {
+      this.say("확인할 빌트인 변경이 없습니다")
+      return
+    }
+    try {
+      this.drift = this.options.markReviewed()
+    } catch (error) {
+      this.say(`스냅샷을 쓰지 못했습니다: ${errorText(error)}`, "error")
+      return
+    }
+    this.say("빌트인 변경을 확인 처리했습니다: 다음 비교 기준이 지금 설치된 OMO가 됩니다", "success")
+  }
+
+  private save(confirmed: boolean): void {
+    const drafts = this.pending()
+    if (!drafts.length) {
+      this.say("저장할 변경이 없습니다")
+      return
+    }
+    let result: SaveResult
+    try {
+      result = this.options.save(drafts, confirmed)
+    } catch (error) {
+      this.say(`저장하지 못했습니다: ${errorText(error)}`, "error")
+      return
+    }
+    if (result.status === "external-change") {
+      this.confirm = "external"
+      this.say("omo.jsonc가 편집기를 연 뒤 바뀌었습니다. s를 한 번 더 누르면 지금 파일에 이 변경을 적용합니다 (다른 키: 취소)", "warning")
+      return
+    }
+    if (result.status === "error") {
+      this.say(result.message, "error")
+      return
+    }
+    this.raw = parseJsonc(result.text)
+    this.drafts.clear()
+    this.saved += result.count
+    this.changed()
+    this.say(`저장했습니다: ${result.count}건 → ${this.options.configPath ?? "omo.jsonc"}${result.backup ? " (이전 파일은 .bak)" : ""}. /reload 하면 적용됩니다`, "success")
+  }
+
+  private close(confirmed: boolean): void {
+    if (this.drafts.size && !confirmed) {
+      this.confirm = "discard"
+      this.say(`저장 안 된 변경 ${this.drafts.size}건: q/Esc를 한 번 더 누르면 버리고 닫습니다 (s: 저장)`, "warning")
+      return
+    }
+    this.options.done({ saved: this.saved })
+  }
+
+  private listKey(key: string, confirm: Confirm): void {
+    const nodes = this.nodes()
+    const node = nodes[this.cursor]
+    const last = Math.max(0, nodes.length - 1)
+    const page = Math.max(1, this.listRows - 2)
+    switch (key) {
+      case "up": this.cursor = Math.max(0, this.cursor - 1); return
+      case "down": this.cursor = Math.min(last, this.cursor + 1); return
+      case "pgup": this.cursor = Math.max(0, this.cursor - page); return
+      case "pgdn": this.cursor = Math.min(last, this.cursor + page); return
+      case "home": this.cursor = 0; return
+      case "end": this.cursor = last; return
+      case "enter": case "right":
+        if (!node) return
+        if (node.readOnly) {
+          this.say(node.readOnly, "warning")
+          return
+        }
+        this.mode = { kind: "chain", key: node.key, cursor: 0 }
+        return
+      case "ch:r": if (node) this.follow(node); return
+      case "ch:x": if (node) this.toggleDisable(node); return
+      case "ch:u": if (node) this.undo(node); return
+      case "ch:h": this.toggleHidden(); return
+      case "tab": this.switchLayer(); return
+      case "ch:c": this.markReviewed(); return
+      case "ch:s": this.save(confirm === "external"); return
+      case "ch:q": case "esc": this.close(confirm === "discard"); return
+    }
+  }
+
+  private chainKey(key: string, mode: ChainMode, confirm: Confirm): void {
+    const node = this.node(mode.key)
+    if (!node) {
+      this.mode = { kind: "list" }
+      return
+    }
+    const chain = this.editChain(node)
+    const last = chain.length
+    const swap = (to: number): void => {
+      const from = mode.cursor
+      if (from >= last || to < 0 || to >= last) return
+      const next = [...chain]
+      ;[next[from], next[to]] = [next[to], next[from]]
+      if (this.updateChain(node, next)) mode.cursor = to
+    }
+    switch (key) {
+      case "up": mode.cursor = Math.max(0, mode.cursor - 1); return
+      case "down": mode.cursor = Math.min(last, mode.cursor + 1); return
+      case "home": case "pgup": mode.cursor = 0; return
+      case "end": case "pgdn": mode.cursor = last; return
+      case "enter": this.openPicker(node, mode, mode.cursor >= last); return
+      case "ch:a": this.openPicker(node, mode, true); return
+      case "ch:e": if (mode.cursor < last) this.openEffort(node, mode.cursor, "effort", chain[mode.cursor]); return
+      case "ch:d": case "delete": case "backspace": {
+        if (mode.cursor >= last) return
+        const next = chain.filter((_, index) => index !== mode.cursor)
+        if (this.updateChain(node, next)) {
+          this.say(`${labelSpec(chain[mode.cursor])} 삭제${next.length ? "" : ": 이제 기본값을 따릅니다"}`)
+          mode.cursor = Math.max(0, Math.min(mode.cursor, next.length - 1))
+        }
+        return
+      }
+      case "ch:K": case "shift-up": swap(mode.cursor - 1); return
+      case "ch:J": case "shift-down": swap(mode.cursor + 1); return
+      case "ch:b": {
+        const models = node.builtin?.models ?? []
+        if (!models.length) {
+          this.say("이 노드에는 OMO 빌트인 체인이 없습니다", "warning")
+          return
+        }
+        const next = this.showHidden ? models : models.filter(spec => rungView(spec, this.options.availability).visible)
+        if (!next.length) {
+          this.say("연결된 빌트인 후보가 없습니다 (h: 미연결 후보 보기)", "warning")
+          return
+        }
+        if (this.updateChain(node, [...next])) {
+          mode.cursor = 0
+          this.say("빌트인 체인을 복사했습니다: 이렇게 고정하면 OMO 업데이트를 따라가지 않습니다 (따라가려면 r)", "warning")
+        }
+        return
+      }
+      case "ch:r": this.follow(node); this.mode = { kind: "list" }; return
+      case "ch:x": this.toggleDisable(node); return
+      case "ch:h": this.toggleHidden(); return
+      case "ch:u": this.undo(node); mode.cursor = 0; return
+      case "ch:s": this.save(confirm === "external"); return
+      case "esc": case "left": case "ch:q": this.mode = { kind: "list" }; return
+    }
+  }
+
+  private pickerModels(filter: string): ModelInfo[] {
+    const { availability } = this.options
+    const order = (provider: string): number => availability.providers.indexOf(provider)
+    const words = filter.toLowerCase().split(/\s+/).filter(Boolean)
+    return [...availability.models.values()]
+      .sort((a, b) => order(a.provider) - order(b.provider) || a.id.localeCompare(b.id))
+      .filter(model => {
+        const text = `${model.provider}/${model.id} ${labelProvider(model.provider)}/${model.id} ${model.name}`.toLowerCase()
+        return words.every(word => text.includes(word))
+      })
+  }
+
+  private openPicker(node: EditorNode, mode: ChainMode, add: boolean): void {
+    const { availability } = this.options
+    if (!availability.known) {
+      this.say(`연결된 모델 목록이 없어 새 모델을 고를 수 없습니다 (${availability.reason}); 삭제·순서·effort는 바꿀 수 있습니다`, "warning")
+      return
+    }
+    const models = this.pickerModels("")
+    if (!models.length) {
+      this.say("이 세션에 연결된 모델이 없습니다", "warning")
+      return
+    }
+    const current = add ? undefined : splitSpec(this.editChain(node)[mode.cursor] ?? "")
+    const pick = current ? models.findIndex(model => current.providers.includes(model.provider) && model.id === current.model) : -1
+    this.scrolls.picker = 0
+    this.mode = { kind: "picker", key: node.key, rung: mode.cursor, add, filter: "", pick: Math.max(0, pick) }
+  }
+
+  private pickerKey(key: string, mode: PickerMode): void {
+    const models = this.pickerModels(mode.filter)
+    const last = Math.max(0, models.length - 1)
+    switch (key) {
+      case "up": mode.pick = Math.max(0, mode.pick - 1); return
+      case "down": mode.pick = Math.min(last, mode.pick + 1); return
+      case "pgup": mode.pick = Math.max(0, mode.pick - 10); return
+      case "pgdn": mode.pick = Math.min(last, mode.pick + 10); return
+      case "home": mode.pick = 0; return
+      case "end": mode.pick = last; return
+      case "esc": this.mode = { kind: "chain", key: mode.key, cursor: mode.rung }; return
+      case "backspace": mode.filter = [...mode.filter].slice(0, -1).join(""); mode.pick = 0; return
+      case "enter": {
+        const model = models[mode.pick]
+        const node = this.node(mode.key)
+        if (!model || !node) {
+          this.say("필터와 맞는 모델이 없습니다", "warning")
+          return
+        }
+        this.openEffort(node, mode.rung, mode.add ? "add" : "replace", joinSpec(model.provider, model.id))
+        return
+      }
+      default:
+        if (key.startsWith("ch:")) {
+          mode.filter += key.slice(3)
+          mode.pick = 0
+        }
+    }
+  }
+
+  private openEffort(node: EditorNode, rung: number, action: EffortMode["action"], spec: string): void {
+    const parts = splitSpec(spec)
+    if (!parts) {
+      this.say(`${spec}: provider/model 형식이 아닙니다`, "error")
+      return
+    }
+    const provider = parts.providers[0]
+    const levels = (this.options.levels ?? (model => effortLevels(model)))(this.options.availability.models.get(`${provider}/${parts.model}`))
+    const current = action === "add" ? undefined : splitSpec(this.editChain(node)[rung] ?? "")?.effort
+    const options = [NO_EFFORT, ...levels, ...(current && !levels.includes(current) ? [current] : [])]
+    // A new rung starts at high when the model offers it, else at no suffix.
+    const wanted = current ?? (action === "add" && levels.includes("high") ? "high" : undefined)
+    this.mode = { kind: "effort", key: node.key, rung, action, provider, model: parts.model, options, pick: Math.max(0, options.indexOf(wanted ?? NO_EFFORT)) }
+  }
+
+  private effortKey(key: string, mode: EffortMode): void {
+    switch (key) {
+      case "up": mode.pick = Math.max(0, mode.pick - 1); return
+      case "down": mode.pick = Math.min(mode.options.length - 1, mode.pick + 1); return
+      case "home": case "pgup": mode.pick = 0; return
+      case "end": case "pgdn": mode.pick = mode.options.length - 1; return
+      case "esc": case "left": this.mode = { kind: "chain", key: mode.key, cursor: mode.rung }; return
+      case "enter": this.applyEffort(mode); return
+    }
+  }
+
+  private applyEffort(mode: EffortMode): void {
+    const back: ChainMode = { kind: "chain", key: mode.key, cursor: mode.rung }
+    this.mode = back
+    const node = this.node(mode.key)
+    if (!node) return
+    const choice = mode.options[mode.pick]
+    const spec = joinSpec(mode.provider, mode.model, choice === NO_EFFORT ? undefined : choice)
+    const chain = this.editChain(node)
+    const existing = chain.indexOf(spec)
+    if (mode.action !== "add" && chain[mode.rung] === spec) return
+    if (existing >= 0) {
+      back.cursor = existing
+      this.say(`${labelSpec(spec)}은 이미 ${existing + 1}번째에 있습니다`, "warning")
+      return
+    }
+    if (mode.action === "add") {
+      const at = mode.rung < chain.length ? mode.rung + 1 : chain.length
+      if (this.updateChain(node, [...chain.slice(0, at), spec, ...chain.slice(at)])) {
+        back.cursor = at
+        this.say(`${at + 1}번에 ${labelSpec(spec)} 추가`, "success")
+      }
+      return
+    }
+    if (this.updateChain(node, chain.map((item, index) => (index === mode.rung ? spec : item))))
+      this.say(`${mode.rung + 1}번: ${labelSpec(spec)}`, "success")
+  }
+
+  /** Header, the list (or the chain, picker, effort view), the selected node's
+   * details and the key help, each line exactly `width` cells wide and the whole
+   * view within the overlay height. */
+  render(width: number): string[] {
+    const w = Math.max(1, Math.floor(width))
+    const nodes = this.nodes()
+    this.cursor = Math.max(0, Math.min(this.cursor, nodes.length - 1))
+    if (this.mode.kind !== "list" && !this.node(this.mode.key)) this.mode = { kind: "list" }
+    const mode = this.mode
+    const focus = mode.kind === "list" ? nodes[this.cursor] : this.node(mode.key)
+    const height = this.height()
+    // The body keeps at least three rows: key help, then header notes give way.
+    const header = this.headerItems(w)
+    const keys = this.wrapped(this.keyHelp(), w, "dim")
+    const status = this.statusItems(w)
+    const fixed = (): number => header.length + keys.length + status.length + 1
+    const keyLines = keys.length
+    while (fixed() + 3 > height && keys.length > 1) keys.pop()
+    if (keys.length < keyLines) keys[keys.length - 1] = { ...keys[keys.length - 1], text: `${keys[keys.length - 1].text.trimEnd()} …` }
+    while (fixed() + 3 > height && header.length > 1) header.pop()
+    const room = Math.max(3, height - fixed())
+    const detail = mode.kind === "list" || mode.kind === "chain" ? this.detailItems(focus, w) : []
+    let detailRows = Math.min(detail.length, Math.floor(room * 0.4), room - 4)
+    if (detailRows < 2) detailRows = 0
+    const bodyRows = room - (detailRows ? detailRows + 1 : 0)
+    if (mode.kind === "list") this.listRows = bodyRows
+    const body = mode.kind === "list" ? this.listItems(nodes)
+      : mode.kind === "chain" ? this.chainItems(focus as EditorNode, mode)
+      : mode.kind === "picker" ? this.pickerItems(mode) : this.effortItems(mode)
+    const rule: Item = { text: "─".repeat(w), color: "borderMuted" }
+    const shown = detail.length > detailRows ? [...detail.slice(0, detailRows - 1), { text: "  …", color: "dim" }] : detail
+    return [
+      ...[...header, rule].map(item => this.line(item, w)),
+      ...this.window(body.items, body.focus, bodyRows, w, mode.kind),
+      ...(detailRows ? [rule, ...shown] : []).map(item => this.line(item, w)),
+      ...[...keys, ...status].map(item => this.line(item, w)),
+    ]
+  }
+
+  private paint(color: string, text: string): string {
+    try {
+      return this.theme?.fg ? this.theme.fg(color, text) : text
+    } catch {
+      return text
+    }
+  }
+
+  private line(item: Item, width: number): string {
+    const text = fitCells(item.text, width)
+    const bold = item.bold && this.theme?.bold ? this.theme.bold(text) : text
+    return item.color ? this.paint(item.color, bold) : bold
+  }
+
+  private wrapped(text: string, width: number, color?: string): Item[] {
+    return wrapText(text, width, width >= 8 ? "  " : "").map(line => ({ text: line, color }))
+  }
+
+  /** `rows` lines of `items`, scrolled so the focused item (and the section
+   * title right above it) stays visible. */
+  private window(items: Item[], focus: number, rows: number, width: number, key: string): string[] {
+    let start = this.scrolls[key] ?? 0
+    const top = focus > 0 && items[focus - 1]?.header ? focus - 1 : focus
+    if (top < start) start = top
+    if (focus >= start + rows) start = focus - rows + 1
+    start = Math.max(0, Math.min(start, items.length - rows))
+    this.scrolls[key] = start
+    const out = items.slice(start, start + rows).map(item => this.line(item, width))
+    while (out.length < rows) out.push(" ".repeat(width))
+    return out
+  }
+
+  /** A chain for display: provider labels, groups narrowed to connected
+   * providers, unconnected rungs dropped with a count (`hide`) or marked. */
+  private chainText(specs: readonly string[], hide: boolean): string {
+    const shown: string[] = []
+    let hidden = 0
+    for (const spec of specs) {
+      const view = rungView(spec, this.options.availability)
+      if (!view.visible && hide && !this.showHidden) hidden++
+      else shown.push(view.visible ? labelSpec(connectedSpec(spec, view)) : `${labelSpec(spec)}(미연결)`)
+    }
+    const text = shown.length ? shown.join(" → ") : specs.length ? "(연결된 후보 없음)" : "(체인 없음)"
+    return hidden ? `${text}  +${hidden} 숨김` : text
+  }
+
+  private overrideText(override: Override | undefined, fallback: string): string {
+    if (!override || (!override.chain && override.disable === undefined)) return `설정 없음 (${fallback})`
+    const parts: string[] = []
+    if (override.chain) parts.push(override.chain.length ? this.chainText(override.chain, false) : "(빈 체인)")
+    if (override.disable !== undefined) parts.push(`disable: ${override.disable}`)
+    return parts.join(" · ")
+  }
+
+  private headerItems(width: number): Item[] {
+    const { omo, profile, availability, warnings = [] } = this.options
+    const section = harnessKey(layerObject(this.raw, { profile: this.layer }))
+    const items: Item[] = [{
+      text: `라우팅 편집${omo ? ` · OMO ${omo}` : ""} · 편집 레이어: ${this.layerLabel()}${section ? ` ${section}` : ""}${profile !== undefined ? " (Tab 전환)" : ""}`,
+      color: "accent", bold: true,
+    }]
+    items.push(...this.wrapped(availability.known
+      ? `연결된 프로바이더: ${availability.providers.map(labelProvider).join(", ") || "없음"} · 미연결 후보 ${this.showHidden ? "표시 중" : "숨김"} (h)`
+      : `구독 정보를 읽지 못해 모든 후보를 표시합니다 (${availability.reason})`, width, availability.known ? "muted" : "warning"))
+    // Builtin changes come before other notes: they are what a review is for.
+    if (this.drift?.count) items.push(...this.wrapped(this.driftSummary(), width, "warning").slice(0, 3))
+    const notes = warnings.flatMap(text => this.wrapped(`⚠ ${text}`, width, "warning"))
+    items.push(...(notes.length > 4 ? [...notes.slice(0, 3), { text: `⚠ 경고가 더 있습니다 (${warnings.length}건)`, color: "warning" }] : notes))
+    return items
+  }
+
+  private driftSummary(): string {
+    const drift = this.drift as Drift
+    const parts = ([["new", "신규"], ["changed", "변경"], ["removed", "제거"]] as const).flatMap(([kind, label]) => {
+      const names = driftNames(drift, kind)
+      return names.length ? [`${label} ${names.length} (${names.join(", ")})`] : []
+    })
+    return `빌트인 변경${drift.since ? ` (OMO ${drift.since}에서 확인한 뒤)` : ""}: ${parts.join(" · ")} · c: 확인 처리`
+  }
+
+  private keyHelp(): string {
+    switch (this.mode.kind) {
+      case "list":
+        return ["↑↓ 이동", "Enter 체인 편집", "r 기본값 따르기", "x 비활성 전환", "u 변경 취소", "h 미연결 후보",
+          ...(this.options.profile !== undefined ? ["Tab 레이어"] : []), ...(this.drift?.count ? ["c 변경 확인"] : []), "s 저장", "q 닫기"].join(" · ")
+      case "chain":
+        return ["↑↓ 이동", "a 추가", "Enter 교체/추가", "e effort", "d 삭제", "K/J 위·아래로", "b 빌트인 복사", "r 기본값 따르기",
+          "x 비활성", "h 미연결 후보", "u 변경 취소", "s 저장", "Esc 목록"].join(" · ")
+      case "picker":
+        return "글자 입력: 필터 · Backspace 지우기 · ↑↓ 이동 · Enter 선택 · Esc 취소"
+      default:
+        return "↑↓ 이동 · Enter 선택 · Esc 취소"
+    }
+  }
+
+  private statusItems(width: number): Item[] {
+    const status = this.message
+      ?? (this.drafts.size ? { text: `저장 안 된 변경 ${this.drafts.size}건 · s 저장`, tone: "warning" as Tone }
+        : this.saved ? { text: `이번에 저장한 변경 ${this.saved}건 · /reload 하면 적용됩니다`, tone: "success" as Tone } : undefined)
+    return status ? this.wrapped(status.text, width, TONES[status.tone]).slice(0, 2) : [{ text: "" }]
+  }
+
+  private badge(node: EditorNode): string {
+    const kind = this.driftOf(node)?.kind
+    return kind === "new" ? "NEW" : kind === "changed" ? "변경됨" : kind === "removed" ? "제거됨" : ""
+  }
+
+  private listItems(nodes: EditorNode[]): { items: Item[]; focus: number } {
+    const nameWidth = Math.min(24, Math.max(4, ...nodes.map(node => displayWidth(node.label))))
+    const items: Item[] = []
+    let focus = 0
+    let section: string | undefined
+    nodes.forEach((node, index) => {
+      const title = node.section === "model_profiles" ? "main" : node.section
+      if (title !== section) {
+        section = title
+        items.push({ text: title, color: "muted", bold: true, header: true })
+      }
+      const selected = index === this.cursor
+      if (selected) focus = items.length
+      const badges = [this.badge(node), this.dirty(node) ? "*" : "", nodeWarnings(node, this.options.availability).length ? "⚠" : ""].filter(Boolean).join(" ")
+      const summary = node.readOnly ?? (node.effective.source === "disabled" ? "(비활성)" : this.chainText(node.effective.display, true))
+      items.push({
+        text: `${selected ? "▸" : " "} ${padCells(node.label, nameWidth)}  ${padCells(nodeState(node, this.layer), 6)}  ${padCells(badges, 8)}  ${summary}`,
+        color: selected ? "accent" : node.effective.source === "disabled" ? "dim" : undefined, bold: selected,
+      })
+    })
+    return { items, focus }
+  }
+
+  private chainItems(node: EditorNode, mode: ChainMode): { items: Item[]; focus: number } {
+    const chain = this.editChain(node)
+    mode.cursor = Math.min(mode.cursor, chain.length)
+    const own = (this.layer === undefined ? node.base : node.profile)?.chain?.length
+    const items: Item[] = [{ text: `${node.label} · ${this.layerLabel()} 편집 · 상태 ${nodeState(node, this.layer)}`, bold: true, header: true }]
+    if (!own) items.push({ text: "  아래 레이어/빌트인 체인을 보여 줍니다. 바꾸면 이 레이어의 커스텀 체인이 됩니다 (r: 다시 따르기)", color: "dim", header: true })
+    const specWidth = Math.min(40, Math.max(8, ...chain.map(spec => displayWidth(labelSpec(spec)))))
+    const first = items.length
+    chain.forEach((spec, index) => {
+      const view = rungView(spec, this.options.availability)
+      const parts = splitSpec(spec)
+      const info = parts && this.options.availability.models.get(`${parts.providers[0]}/${parts.model}`)
+      const tag = !view.visible ? "미연결" : view.unknown ? "⚠ 연결된 모델 목록에 없음" : info?.name ?? ""
+      const selected = index === mode.cursor
+      items.push({
+        text: `${selected ? "▸" : " "} ${String(index + 1).padStart(2)}. ${padCells(labelSpec(spec), specWidth)}  ${tag}`,
+        color: selected ? "accent" : view.visible ? undefined : "dim", bold: selected,
+      })
+    })
+    const onAdd = mode.cursor >= chain.length
+    items.push({ text: `${onAdd ? "▸" : " "}  + 모델 추가`, color: onAdd ? "accent" : "muted", bold: onAdd })
+    for (const warning of chainWarnings(chain, this.options.availability)) items.push({ text: `⚠ ${warning}`, color: "warning" })
+    return { items, focus: first + mode.cursor }
+  }
+
+  private pickerItems(mode: PickerMode): { items: Item[]; focus: number } {
+    const models = this.pickerModels(mode.filter)
+    mode.pick = Math.max(0, Math.min(mode.pick, models.length - 1))
+    const total = this.options.availability.models.size
+    const items: Item[] = [{
+      text: `모델 선택 (${mode.add ? "추가" : `${mode.rung + 1}번 교체`}) · 필터: ${mode.filter}▏ · ${models.length}/${total}`,
+      bold: true, header: true,
+    }]
+    const idWidth = Math.min(44, Math.max(8, ...models.map(model => displayWidth(`${labelProvider(model.provider)}/${model.id}`))))
+    models.forEach((model, index) => {
+      const selected = index === mode.pick
+      items.push({ text: `${selected ? "▸" : " "} ${padCells(`${labelProvider(model.provider)}/${model.id}`, idWidth)}  ${model.name}`, color: selected ? "accent" : undefined, bold: selected })
+    })
+    if (!models.length) items.push({ text: "  (필터와 맞는 모델 없음)", color: "dim" })
+    return { items, focus: models.length ? 1 + mode.pick : 1 }
+  }
+
+  private effortItems(mode: EffortMode): { items: Item[]; focus: number } {
+    const items: Item[] = [{ text: `effort 선택 · ${labelProvider(mode.provider)}/${mode.model}`, bold: true, header: true }]
+    mode.options.forEach((option, index) => {
+      const selected = index === mode.pick
+      items.push({ text: `${selected ? "▸" : " "} ${option}`, color: selected ? "accent" : undefined, bold: selected })
+    })
+    return { items, focus: 1 + mode.pick }
+  }
+
+  private detailItems(node: EditorNode | undefined, width: number): Item[] {
+    if (!node) return []
+    const out: Item[] = []
+    const add = (text: string, color?: string): void => {
+      out.push(...wrapText(text, width, width >= 12 ? "    " : "").map(line => ({ text: line, color })))
+    }
+    add(`${node.label}: ${node.description}`, "muted")
+    if (node.readOnly) {
+      add(node.readOnly)
+      return out
+    }
+    const drift = this.driftOf(node)
+    const { profile, omo, availability } = this.options
+    add(`빌트인${omo ? ` (OMO ${omo})` : ""}: ${node.builtin ? this.chainText(node.builtin.display, true) : node.userOnly ? "없음 (사용자 정의 노드)" : "읽지 못함"}`)
+    if (drift?.kind === "changed" && drift.before) add(`이전 빌트인${this.drift?.since ? ` (OMO ${this.drift.since})` : ""}: ${formatChain(drift.before)}`, "dim")
+    if (drift?.kind === "new") add("이번 OMO에서 새로 생긴 노드입니다", "warning")
+    if (drift?.kind === "removed") add("OMO 빌트인에서 빠졌습니다: 지금은 내 설정만 남아 있습니다", "warning")
+    add(`base: ${this.overrideText(node.base, "빌트인을 따름")}`)
+    if (profile !== undefined) add(`profile ${profile}: ${this.overrideText(node.profile, node.base?.chain ? "base를 따름" : "빌트인을 따름")}`)
+    add(`적용: ${node.effective.source === "disabled" ? "(비활성)" : `${this.chainText(node.effective.display, true)}  [${node.effective.source}]`}`)
+    if (drift?.kind === "changed" && (node.base?.chain || node.profile?.chain))
+      add("⚠ 빌트인이 바뀌었지만 내 체인이 그 위를 덮고 있습니다: r로 기본값을 따르면 업데이트가 반영됩니다", "warning")
+    if (this.layer === undefined && profile !== undefined && node.profile?.chain)
+      add(`⚠ profile ${profile}의 체인이 이 노드를 덮습니다: base 변경은 이 프로필 세션에 보이지 않습니다`, "warning")
+    for (const warning of nodeWarnings(node, availability)) add(`⚠ ${warning}`, "warning")
+    return out
+  }
+
+  private height(): number {
+    const rows = Math.floor(Number(this.options.rows?.()) || 30)
+    return Math.max(8, Math.min(Math.floor(rows * 0.92), rows - 2))
+  }
+}
+
 export function createRouting(pi: any, deps: Deps = {}) {
   const env = deps.env ?? process.env
   const home = deps.home ?? (userInfo().homedir || homedir())
@@ -1237,6 +2585,21 @@ export function createRouting(pi: any, deps: Deps = {}) {
 
   const omoDir = join(home, ".omo")
   const findConfig = () => ["omo.jsonc", "omo.json"].map((f) => join(omoDir, f)).find((p) => existsSync(p))
+  /** OMO also merges project configs found from the session's cwd upward. */
+  const projectCwd = (ctx: any): string | undefined => deps.cwd ?? (typeof ctx?.cwd === "string" ? ctx.cwd : undefined)
+  const projectFound = (ctx: any): ProjectConfig[] => {
+    const cwd = projectCwd(ctx)
+    return cwd ? projectConfigs(cwd, home) : []
+  }
+  /** Read-only: the reports compare with the last reviewed snapshot but never write it. */
+  const reviewDrift = (builtin: BuiltinRouting): Drift | undefined => {
+    const reviewed = readSnapshot(snapshotPath(home))
+    if (!reviewed || builtin.status !== "loaded") return undefined
+    const drift = snapshotDrift(reviewed, builtinSnapshot(builtin, omoVersion(env)))
+    return drift.count ? drift : undefined
+  }
+  // The last report shown, redrawn after the editor saves.
+  let lastView: { wanted: string | undefined; build: (input: ReportInput, width: number) => string[] } | undefined
 
   const show = (
     ctx: any, raw: any, wanted: string | undefined, extra: string[] = [],
@@ -1245,7 +2608,12 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const profiles = profileNames(raw)
     const { config, profile, warning } = applyProfile(raw, wanted)
     // Read the installed source once; the table itself is laid out per viewport.
-    const report = { config, profile, profiles, warning, builtin: loadBuiltinRouting(env), configPath: findConfig() }
+    const builtin = loadBuiltinRouting(env)
+    const report: ReportInput = {
+      config, profile, profiles, warning, builtin, configPath: findConfig(),
+      notices: projectFound(ctx).map(found => projectNotice(found)), drift: reviewDrift(builtin),
+    }
+    lastView = { wanted, build }
     const lines = (width: number) => [...extra, ...build(report, width)]
     // Widget hosts get the table above the editor and nothing else;
     // hosts without a widget get the whole report in the toast.
@@ -1269,6 +2637,83 @@ export function createRouting(pi: any, deps: Deps = {}) {
       return
     }
     show(ctx, raw, parsed.base ? undefined : parsed.profile ?? resolveProfileName(env), [], buildModelsReport)
+  }
+
+  /** `/routing edit`: the interactive overlay. Opens on the current (or named)
+   * profile's layer with base one Tab away, or on base alone with --base. */
+  const editor = async (words: string[], ctx: any) => {
+    const parsed = parseModelsArgs(words, "edit")
+    if (typeof parsed === "string") { ctx.ui.notify(`routing: ${parsed}`, "error"); return }
+    if (typeof ctx?.ui?.custom !== "function" || (ctx.mode !== undefined && ctx.mode !== "tui")) {
+      ctx.ui.notify("routing: /routing edit needs the interactive omo TUI; here use /routing set|prepend|add|remove (see /routing help)", "error")
+      return
+    }
+    const cfgPath = findConfig() ?? join(omoDir, "omo.jsonc")
+    let openedText = existsSync(cfgPath) ? readFileSync(cfgPath, "utf8") : undefined
+    let raw: any
+    try {
+      raw = openedText === undefined ? {} : parseJsonc(openedText)
+    } catch (error) {
+      ctx.ui.notify(`routing: cannot parse ${cfgPath}: ${errorText(error)}`, "error")
+      return
+    }
+    const profiles = profileNames(raw)
+    if (parsed.profile && !profiles.includes(parsed.profile)) {
+      ctx.ui.notify(`routing: no profile "${parsed.profile}" in omo.jsonc (available profiles: ${profiles.length ? profiles.join(", ") : "none"})`, "error")
+      return
+    }
+    const envProfile = resolveProfileName(env)
+    const profile = parsed.base ? undefined : parsed.profile ?? (envProfile !== undefined && profiles.includes(envProfile) ? envProfile : undefined)
+    const warnings: string[] = []
+    if (!parsed.base && !parsed.profile && envProfile !== undefined && !profiles.includes(envProfile))
+      warnings.push(`환경이 가리키는 프로필 "${envProfile}"이 omo.jsonc에 없어 base만 편집합니다`)
+    const builtin = loadBuiltinRouting(env)
+    if (builtin.status !== "loaded") warnings.push(`OMO 빌트인 기본값을 읽지 못해 설정된 체인만 보입니다 (${builtin.reason})`)
+    else for (const [section, reason] of Object.entries(builtin.defaults.unavailable))
+      warnings.push(`빌트인 ${SECTION_LABELS[section as BuiltinSection]}을 읽지 못해 그 노드는 설정된 체인만 보입니다 (${reason})`)
+    for (const found of projectFound(ctx)) warnings.push(projectNotice(found, true))
+    const omo = omoVersion(env)
+    const snapshotFile = snapshotPath(home)
+    const current = builtinSnapshot(builtin, omo)
+    let reviewed = readSnapshot(snapshotFile)
+    // The first open records what is installed now as reviewed, so only later
+    // OMO updates are reported as changes.
+    if (!reviewed && Object.keys(current.sections).length) {
+      try {
+        writeSnapshot(snapshotFile, current)
+        reviewed = current
+      } catch (error) {
+        warnings.push(`빌트인 스냅샷을 쓰지 못해 변경 추적이 꺼집니다: ${errorText(error)}`)
+      }
+    }
+    const levels = await hostThinkingLevels(env)
+    const availability = availabilityOf(ctx.modelRegistry)
+    const result = await ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: { saved: number }) => void) => new RoutingEditor({
+      raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
+      drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
+      levels: model => effortLevels(model, levels),
+      save: (drafts, confirmExternal) => {
+        const saved = saveConfig({ path: cfgPath, openedText, drafts, confirmExternal })
+        if (saved.status === "saved") openedText = saved.text
+        return saved
+      },
+      markReviewed: () => {
+        reviewed = mergeSnapshot(reviewed, current)
+        writeSnapshot(snapshotFile, reviewed)
+        return snapshotDrift(reviewed, current)
+      },
+      done,
+      rows: () => tui?.terminal?.rows ?? 30,
+      requestRender: () => tui?.requestRender?.(),
+    }, theme, keybindings), { overlay: true, overlayOptions: { ...EDITOR_OVERLAY } })
+    const saved = typeof result?.saved === "number" ? result.saved : 0
+    if (!saved) return
+    const backup = existsSync(`${cfgPath}.bak`) ? ` (previous version: ${cfgPath}.bak)` : ""
+    ctx.ui.notify(`routing: saved ${saved} change(s) to ${cfgPath}${backup}; /reload to apply`, "info")
+    if (shown && lastView) {
+      const text = findConfig()
+      show(ctx, text ? parseJsonc(readFileSync(text, "utf8")) : {}, lastView.wanted, [], lastView.build)
+    }
   }
 
   const edit = (args: string, ctx: any) => {
@@ -1311,8 +2756,8 @@ export function createRouting(pi: any, deps: Deps = {}) {
   }
 
   pi.registerCommand("routing", {
-    description: "show effective model chains (config + installed OMO defaults), or edit config; `help` lists the forms",
-    argumentHint: "[profile|base|off|help|models|set|prepend|add|remove ...]",
+    description: "show effective model chains (config + installed OMO defaults), or edit config (`edit` opens an interactive editor); `help` lists the forms",
+    argumentHint: "[profile|base|off|help|models|edit|set|prepend|add|remove ...]",
     handler: async (args: string, ctx: any) => {
       const hasWidget = typeof ctx?.ui?.setWidget === "function"
       const arg = (args ?? "").trim()
@@ -1324,6 +2769,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
       }
       const words = arg.split(/\s+/).filter(Boolean)
       if (words[0] === "models") { models(words.slice(1), ctx); return }
+      if (words[0] === "edit") { await editor(words.slice(1), ctx); return }
       if (EDIT_VERBS.has(words[0])) { edit(arg, ctx); return }
       const cfgPath = findConfig()
       const raw = cfgPath ? parseJsonc(readFileSync(cfgPath, "utf8")) : {}

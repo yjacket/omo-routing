@@ -5,7 +5,9 @@
 Senpi/OMO extension that prints **effective routing candidates** from
 `~/.omo/omo.jsonc` and the installed OMO builtin defaults: main-session,
 category, and agent chains for the current profile, a named profile, or base.
-It works without a user config; it does not check provider authentication or availability.
+It works without a user config. The reports do not check provider authentication
+or availability; the interactive editor (`/routing edit`) hides candidates of
+providers the running session is not connected to.
 
 ## What it does
 
@@ -14,6 +16,7 @@ It works without a user config; it does not check provider authentication or ava
 /routing <profile>  that profile's overlay applied on top of the base config
 /routing base       base config only, no profile overlay
 /routing models     categories grouped by model and fallback position
+/routing edit       interactive editor for every chain (omo TUI; see "Interactive editor")
 /routing off        hide the widget (a bare /routing also toggles it off)
 /routing help       usage for every form (also -h / --help)
 ```
@@ -78,8 +81,8 @@ stack cells in column order. No configuration is written.
   editing therefore turns that default into a user-configured ordered list.
   Separately displayed agent fallback branches are not appended to an already
   configured chain. Removing all category/agent models can reactivate defaults.
-- Editing still requires an existing omo.jsonc/omo.json; displaying defaults
-  never creates a config file.
+- These commands require an existing omo.jsonc/omo.json (the interactive
+  editor creates one when it saves); displaying defaults never creates a config file.
 
 The edit is applied to the omo.jsonc text at byte offsets: comments, key
 order, and the inline/multiline style of the touched value are preserved;
@@ -109,6 +112,14 @@ The report shows:
   builtin defaults.
 - `warning:` also identifies an environment-selected profile that does not
   exist (base shown instead).
+- `warning: project config <path> also sets routing ...` — OMO also merges the
+  `.omo/omo.jsonc` (else `omo.json`) of the session's working directory and each
+  parent up to, not including, home. Such a file that sets routing can override
+  what the report and the editor show; one that cannot be read is named too.
+- `builtin changes since last review (reviewed on OMO <version>): new N (...),
+  changed N (...), removed N (...); /routing edit to review` — shown when
+  `~/.omo/routing-builtin-snapshot.json` (see "Interactive editor") exists and
+  the installed builtin routing differs from it. Reports never write that file.
 - `main (<name>)`, `categories:`, `agents:` — the selected main chain and
   sorted category/agent rows, including builtin entries absent from config.
 
@@ -132,9 +143,10 @@ marked `(disabled)`. An empty selected main profile stays visible rather than
 silently disappearing. Empty category/agent sections are omitted.
 
 Chain labels are **display-only** (also in builtin groups, fallback branches,
-and edit results). Provider legend: `codex` = `openai-codex`, `claude` =
-`claude-sdk-oauth`, `gh` = `github-copilot`; all others, including `devin`,
-stay unchanged. Effort legend: `X` = max, `E` = xhigh, `H` = high,
+and edit results). Provider legend: `codex` = `chatgpt-subscription` or
+`openai-codex`, `claude` = `anthropic-subscription` or `claude-sdk-oauth`
+(OMO renamed the subscription providers in 2026-09), `gh` = `github-copilot`;
+all others, including `devin`, stay unchanged. Effort legend: `X` = max, `E` = xhigh, `H` = high,
 `M` = medium, `L` = low, `O` = off or none, `mi` = minimal, `au` = auto.
 Only a final `:effort` suffix is shortened; model names such as
 `swe-2-high` and unknown provider/effort values are preserved verbatim.
@@ -150,6 +162,92 @@ preferred model before the builtin fallback table. Configured agents can
 also show a separate `builtin fallback: ...` line in the routing cell, used if their own
 candidates cannot resolve. These are pre-availability candidates, not a
 promise that every listed model will run or that this is the live retry chain.
+
+### Interactive editor
+
+```
+/routing edit             the current profile's layer, base one Tab away (base alone when no profile is set)
+/routing edit -p <name>   that profile's layer (also --profile <name>)
+/routing edit --base      base alone, no profile overlay
+```
+
+`/routing edit` opens an overlay in the omo TUI (`ctx.ui.custom`); anywhere
+else it is an error pointing at `set|prepend|add|remove`. Every change is made
+by selecting: no category name or model ID is typed.
+
+The list holds every routing node of the installed OMO build: the selected main
+profile (read-only when `model_profile` is unset or pins a model), then every
+category and agent that is builtin or set in base or the profile. A category
+added by an OMO release appears without updating this extension; user-only
+nodes such as `implementer` are listed too. Each row has a state word for the
+layer being edited:
+
+- `빌트인` (builtin): neither layer sets a chain; OMO's builtin applies and
+  follows OMO updates.
+- `base`: editing a profile, and only base sets a chain.
+- `커스텀` (custom): the edited layer sets its own chain.
+- `비활성` (disabled): `disable: true` applies.
+- `없음` (none): no chain anywhere.
+
+Badges: `NEW`, `변경됨` (changed) and `제거됨` (removed) mark builtin changes
+since the last review, `*` marks unsaved edits, and `⚠` marks a warning: a rung
+the connected providers do not list, adjacent rungs of one model that differ
+only in effort (limits are per account, so they are no fallback), or no
+connected candidate at all.
+
+Row chains and the detail pane under the list (description, this OMO version's
+builtin chain, the previous builtin chain when it changed, the base and profile
+overrides, the effective chain and warnings) show only candidates this session
+can run. Connected providers come from `ctx.modelRegistry.getAvailable()`, the
+list OMO itself filters builtin rungs with. Rungs of unconnected providers are
+hidden behind a `+N 숨김` count, and builtin provider groups keep only their
+connected providers; `h` shows the hidden rungs marked `(미연결)`. Without a
+readable registry nothing is hidden, a notice says so, and no model can be
+picked (removing, reordering and effort changes still work).
+
+| View | Keys (also shown in the footer) |
+| --- | --- |
+| list | ↑↓ PgUp PgDn Home End move · Enter open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `s` save · `q`/Esc close |
+| chain | ↑↓ move · `a` add after the cursor (Enter on `+ 모델 추가` too) · Enter replace the model · `e` effort · `d`/Delete remove · `K`/`J` or Shift+↑/↓ move · `b` copy the builtin chain · `r` follow · `x` disable · `h` hidden · `u` undo · `s` save · Esc/←/`q` back |
+| model picker | type to filter (every word must match the provider, id or name) · Backspace · ↑↓ · Enter pick · Esc cancel |
+| effort | ↑↓ · Enter · Esc; `(없음)` means no `:effort` suffix |
+
+The picker lists only connected models. Efforts come from the host's own
+`getSupportedThinkingLevels` (imported from the pi-ai copy the installed OMO
+uses), else from the model's metadata; a new rung starts at `high` when the
+model offers it. A model already in the chain is not added a second time.
+
+A node without a chain in the edited layer is shown with the chain it inherits
+(base, then OMO's builtin) minus hidden rungs; the first change turns that into
+the layer's own chain. `r` (follow) removes the layer's chain instead, so the
+node tracks base or OMO's builtin, including future OMO updates, which a copied
+chain (`b`) does not. A node without a builtin cannot lose its last model.
+
+Edits are staged per layer and nothing is written until `s`; closing with
+unsaved edits asks once. Saving applies every staged edit to omo.jsonc at byte
+offsets, as `/routing set` does:
+
+- a chain is written as `models` in the layer's `[native]` (a legacy `[senpi]`,
+  the layer root or a new `[native]` by the same rule), and that node's `model`
+  and `fallback_models` are removed from the layer, so the chain is exactly the
+  one shown;
+- follow removes that node's `model`, `models` and `fallback_models` from the
+  layer, keeps keys such as `description`, and removes an entry left empty;
+- the disable toggle writes or removes `disable`.
+
+The result must parse, the previous file is kept as `omo.jsonc.bak`, and a
+missing omo.jsonc is created. If the file changed on disk after the editor
+opened, the first `s` warns and a second `s` applies the edits on top of the
+newer file. Saved changes take effect after `/reload`; the closing notice says
+so, and a shown `/routing` widget is redrawn from the saved file.
+
+Builtin changes: the editor keeps the builtin routing you last reviewed in
+`~/.omo/routing-builtin-snapshot.json`. The first `/routing edit` records the
+installed build silently. After an OMO update the header, the badges and the
+detail pane show new, changed (old and new chain) and removed nodes, and flag
+chains of yours that now hide a changed builtin. `c` makes the installed build
+the new baseline. A builtin section that could not be read is neither compared
+nor overwritten.
 
 ## Config resolution
 
@@ -224,8 +322,11 @@ their shape fails it.
 
 ## Limits
 
-- Nothing is checked against live provider state — no registry availability,
-  no `auth.json` credentials, no `credential-pool-state.json` backoff. Builtin
+- The reports check nothing against live provider state: no registry
+  availability, no `auth.json` credentials, no `credential-pool-state.json`
+  backoff. Only `/routing edit` reads the session's connected models
+  (`ctx.modelRegistry.getAvailable()`), to hide and offer candidates; it reads
+  no credentials either. Builtin
   model/provider IDs are taken as declared by OMO, before registry alias
   normalization; only the display labels above are shortened. Session/CLI model overrides and runtime retry filtering are
   not inferred from this report.
@@ -233,8 +334,11 @@ their shape fails it.
   recognizable table shapes. Bare Senpi or a future incompatible bundle gets
   configured-only output with a warning for the affected sections, not
   guessed defaults.
-- `set`/`add`/`remove` are the only writes, and they only touch the one
-  `models` array (plus a sibling `model` key on `set`); provider state is never
+- `set`/`add`/`remove` and the editor's save are the only writes to omo.jsonc.
+  The commands touch the one `models` array (plus a sibling `model` key on
+  `set`); the editor touches only `model`, `models`, `fallback_models` and
+  `disable` of the nodes you changed, and entries it leaves empty. The editor
+  also writes `~/.omo/routing-builtin-snapshot.json`. Provider state is never
   touched. `/routing profile <name>` switching is not offered: the profile is
   fixed by the environment when the host starts.
 - Where the host supports `ctx.ui.setWidget`, the table is shown above the
