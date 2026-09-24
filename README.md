@@ -207,15 +207,16 @@ picked (removing, reordering and effort changes still work).
 
 | View | Keys (also shown in the footer) |
 | --- | --- |
-| list | ↑↓ PgUp PgDn Home End move · Enter open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `s` save · `q`/Esc close |
-| chain | ↑↓ move · `a` add after the cursor (Enter on `+ 모델 추가` too) · Enter replace the model · `e` effort · `d`/Delete remove · `K`/`J` or Shift+↑/↓ move · `b` copy the builtin chain · `r` follow · `x` disable · `h` hidden · `u` undo · `s` save · Esc/←/`q` back |
+| list | ↑↓ PgUp PgDn Home End move · Enter/→ open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `s` save · `q`/Esc close |
+| chain | ↑↓ move · `a` add after the cursor (Enter on `+ 모델 추가` too) · Enter replace the model · `e` effort · `d`/Delete/Backspace remove · `K`/`J` or Shift+↑/↓ move · `b` copy the builtin chain · `r` follow · `x` disable · `h` hidden · `u` undo · `s` save · Esc/←/`q` back |
 | model picker | type to filter (every word must match the provider, id or name) · Backspace · ↑↓ · Enter pick · Esc cancel |
 | effort | ↑↓ · Enter · Esc; `(없음)` means no `:effort` suffix |
 
 The picker lists only connected models. Efforts come from the host's own
 `getSupportedThinkingLevels` (imported from the pi-ai copy the installed OMO
 uses), else from the model's metadata; a new rung starts at `high` when the
-model offers it. A model already in the chain is not added a second time.
+model offers it. The same candidate (model and effort) is not added twice; the
+same model with another effort can be, and adjacent ones are marked `⚠`.
 
 A node without a chain in the edited layer is shown with the chain it inherits
 (base, then OMO's builtin) minus hidden rungs; the first change turns that into
@@ -233,9 +234,12 @@ offsets, as `/routing set` does:
   one shown;
 - follow removes that node's `model`, `models` and `fallback_models` from the
   layer, keeps keys such as `description`, and removes an entry left empty;
-- the disable toggle writes or removes `disable`.
+- the disable toggle writes or removes `disable` (turning a node back on in a
+  profile whose base disables it writes `disable: false`).
 
-The result must parse, the previous file is kept as `omo.jsonc.bak`, and a
+Comments stay where they are, including those next to a removed entry or key.
+The result must parse; the file as it was before the session's first save is
+kept as `omo.jsonc.bak` (later saves in the same session keep that copy); a
 missing omo.jsonc is created. If the file changed on disk after the editor
 opened, the first `s` warns and a second `s` applies the edits on top of the
 newer file. Saved changes take effect after `/reload`; the closing notice says
@@ -243,7 +247,8 @@ so, and a shown `/routing` widget is redrawn from the saved file.
 
 Builtin changes: the editor keeps the builtin routing you last reviewed in
 `~/.omo/routing-builtin-snapshot.json`. The first `/routing edit` records the
-installed build silently. After an OMO update the header, the badges and the
+installed build silently, and a later open does the same for a section the
+snapshot lacks (one that could not be read before). After an OMO update the header, the badges and the
 detail pane show new, changed (old and new chain) and removed nodes, and flag
 chains of yours that now hide a changed builtin. `c` makes the installed build
 the new baseline. A builtin section that could not be read is neither compared

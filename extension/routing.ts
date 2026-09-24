@@ -1103,18 +1103,41 @@ export function setJsoncPath(src: string, path: string[], value: any): string {
   return src.slice(0, last.value.end) + sep + member + src.slice(last.value.end)
 }
 
-/** Remove the member at `path` from the JSONC text (no-op when absent). */
+/** Remove the member at `path` from the JSONC text (no-op when absent). Only
+ * the member and one separating comma go: comments above, beside or below it,
+ * including those of its neighbours, stay; a line the removal leaves blank is dropped. */
 export function removeJsoncPath(src: string, path: string[]): string {
   const root = parseJsoncTree(src)
   const parent = nodeAt(root, path.slice(0, -1))
   const idx = parent?.members?.findIndex((m) => m.key === path.at(-1)) ?? -1
   if (!parent?.members || idx < 0) return src
+  const blank = blankJsonc(src)
+  const commaAfter = (offset: number): number => {
+    let i = offset
+    while (i < blank.length && /\s/.test(blank[i])) i++
+    return blank[i] === "," ? i : -1
+  }
   const m = parent.members[idx]
   const next = parent.members[idx + 1]
   const prev = parent.members[idx - 1]
-  if (next) return src.slice(0, m.keyStart) + src.slice(next.keyStart)
-  if (prev) return src.slice(0, prev.value.end) + src.slice(m.value.end)
-  return src.slice(0, parent.start + 1) + src.slice(m.value.end)
+  let start = m.keyStart
+  let end = m.value.end
+  // A middle member takes its own comma; the last one takes the previous comma.
+  const comma = next ? -1 : prev ? commaAfter(prev.value.end) : -1
+  if (next) {
+    const own = commaAfter(end)
+    if (own >= 0) end = own + 1
+    while (src[end] === " " || src[end] === "\t") end++
+  }
+  const lineStart = src.lastIndexOf("\n", start - 1) + 1
+  const newline = src.indexOf("\n", end)
+  const lineEnd = newline === -1 ? src.length : newline
+  if (/^[ \t]*$/.test(src.slice(lineStart, start)) && /^[ \t\r]*$/.test(src.slice(end, lineEnd))) {
+    start = lineStart
+    end = newline === -1 ? src.length : newline + 1
+  }
+  const out = src.slice(0, start) + src.slice(end)
+  return comma >= 0 ? out.slice(0, comma) + out.slice(comma + 1) : out
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,12 +1164,12 @@ export const HELP_LINES = [
   "  <model>  provider/model[:variant], e.g. openai-codex/gpt-5.6-sol:high",
   "  --profile <p> | --base   layer to write (default: current profile, else base)",
   "",
-  "변경여부: 기본 = same routing as the OMO builtin default, 변경 = differs (chain, disable or inherited category),",
-  "           확인 불가 = the installed builtin routing could not be read.",
   "/routing edit [--profile <p>|-p <p>|--base]   interactive editor in the omo TUI: builtin chains of the",
   "                              installed OMO under your base/profile changes; unconnected providers hidden;",
   "                              builtin changes since the last review flagged; keys are listed in its footer",
   "",
+  "변경여부: 기본 = same routing as the OMO builtin default, 변경 = differs (chain, disable or inherited category),",
+  "           확인 불가 = the installed builtin routing could not be read.",
   "Display only: codex=chatgpt-subscription|openai-codex, claude=anthropic-subscription|claude-sdk-oauth,",
   "              gh=github-copilot; other providers unchanged.",
   "Effort labels: X=max, E=xhigh, H=high, M=medium, L=low, O=off or none, mi=minimal, au=auto.",
@@ -1370,7 +1393,7 @@ export async function hostThinkingLevels(env: Record<string, string | undefined>
 /** One config layer: base (`profile` undefined) or one profile. */
 export type LayerRef = { profile?: string }
 
-const layerObject = (raw: any, layer: LayerRef): any => layer.profile === undefined ? raw : raw?.profiles?.[layer.profile]
+const layerObject = (raw: any, layer: LayerRef): any => layer.profile === undefined ? raw : pathValue(raw, ["profiles", layer.profile])
 /** The harness section OMO applies for a layer, as applyProfile reads it. */
 function harnessKey(layer: any): string | undefined {
   if (!isObj(layer)) return undefined
@@ -1470,8 +1493,13 @@ export function applyDraftsToConfig(raw: any, drafts: readonly EditorDraft[]): a
   const out = cloneValue(isObj(raw) ? raw : {})
   const parentOf = (path: readonly string[], create: boolean): any => {
     let current = out
+    // Own keys only: `__proto__` and friends would reach Object.prototype.
+    if (path.some(key => SKIP_KEYS.has(key))) {
+      if (create) throw new Error(`refusing to edit through the key ${path.find(key => SKIP_KEYS.has(key))}`)
+      return undefined
+    }
     for (const key of path.slice(0, -1)) {
-      if (!isObj(current[key])) {
+      if (!Object.hasOwn(current, key) || !isObj(current[key])) {
         if (!create) return undefined
         current[key] = {}
       }
@@ -1498,7 +1526,7 @@ export type SaveResult =
 /** Write drafts to the config file. `openedText` (the file as the editor read
  * it) guards against silently overwriting an edit made meanwhile; the result
  * must parse, the previous file is kept as `.bak`, a missing file is created. */
-export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean }): SaveResult {
+export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean; backup?: boolean }): SaveResult {
   const { path, openedText, drafts } = options
   let current: string | undefined
   try {
@@ -1514,14 +1542,17 @@ export function saveConfig(options: { path: string; openedText?: string; drafts:
   } catch (error) {
     return { status: "error", message: `refusing to write ${path}: ${errorText(error)}` }
   }
+  // `backup: false` keeps an existing .bak, e.g. the file as it was before an
+  // editor session's first save.
+  const backup = current !== undefined && options.backup !== false
   try {
     if (current === undefined) mkdirSync(dirname(path), { recursive: true })
-    else copyFileSync(path, `${path}.bak`)
+    else if (backup) copyFileSync(path, `${path}.bak`)
     writeFileSync(path, next, "utf8")
   } catch (error) {
     return { status: "error", message: `cannot write ${path}: ${errorText(error)}` }
   }
-  return { status: "saved", text: next, count: drafts.length, ...(current === undefined ? {} : { backup: `${path}.bak` }) }
+  return { status: "saved", text: next, count: drafts.length, ...(backup ? { backup: `${path}.bak` } : {}) }
 }
 
 export type EditorNode = {
@@ -1784,7 +1815,8 @@ const RAW_KEYS: Record<string, string> = {
   "\x1b[1;2A": "shift-up", "\x1b[1;2B": "shift-down",
   "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
   "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end",
-  "\r": "enter", "\n": "enter", "\x1b": "esc", "\t": "tab", "\x7f": "backspace", "\b": "backspace", "\x1b[3~": "delete",
+  // No "\b": legacy terminals send it for ctrl+Backspace.
+  "\r": "enter", "\n": "enter", "\x1b": "esc", "\t": "tab", "\x7f": "backspace", "\x1b[3~": "delete",
 }
 const SELECT_BINDINGS = [
   ["tui.select.up", "up"], ["tui.select.down", "down"], ["tui.select.pageUp", "pgup"],
@@ -1799,21 +1831,25 @@ type KeyMatcher = { matches?(data: string, id: string): boolean }
  * Printable keys held with ctrl/alt/super are ignored, never read as letters. */
 export function decodeKey(data: string, keybindings?: KeyMatcher): string | undefined {
   if (Object.hasOwn(RAW_KEYS, data)) return RAW_KEYS[data]
-  const csi = data.startsWith("\x1b[") ? /^(\d+)(?::\d+)*(?:;(\d+)(?::\d+)*)?u$/.exec(data.slice(2)) : null
-  if (csi) {
-    const code = Number(csi[1])
-    const modifiers = Number(csi[2] ?? "1") - 1
-    if (CSI_U_KEYS[code]) return CSI_U_KEYS[code]
-    if (code < 32 || (modifiers & ~1) !== 0) return undefined
-    const char = String.fromCodePoint(code)
-    return `ch:${modifiers & 1 ? char.toUpperCase() : char}`
-  }
   for (const [id, key] of SELECT_BINDINGS) {
     try {
       if (keybindings?.matches?.(data, id)) return key
     } catch {
       // a host without that binding id
     }
+  }
+  // kitty CSI u (`code;mods u`) and xterm modifyOtherKeys (`27;mods;code ~`).
+  const csi = data.startsWith("\x1b[27;") ? /^(\d+);(\d+)~$/.exec(data.slice(5))?.slice(1).reverse()
+    : data.startsWith("\x1b[") ? /^(\d+)(?::\d+)*(?:;(\d+)(?::\d+)*)?u$/.exec(data.slice(2))?.slice(1) : undefined
+  if (csi) {
+    const code = Number(csi[0])
+    const modifiers = Number(csi[1] ?? "1") - 1
+    // Held ctrl/alt/super never edit: ctrl+Backspace is not Backspace.
+    if ((modifiers & ~1) !== 0) return undefined
+    if (CSI_U_KEYS[code]) return CSI_U_KEYS[code]
+    if (code < 32) return undefined
+    const char = String.fromCodePoint(code)
+    return `ch:${modifiers & 1 ? char.toUpperCase() : char}`
   }
   return [...data].length === 1 && data >= " " ? `ch:${data}` : undefined
 }
@@ -2568,7 +2604,7 @@ export class RoutingEditor {
 
   private height(): number {
     const rows = Math.floor(Number(this.options.rows?.()) || 30)
-    return Math.max(8, Math.min(Math.floor(rows * EDITOR_HEIGHT), rows - 2))
+    return Math.max(1, Math.min(Math.floor(rows * EDITOR_HEIGHT), rows - 2))
   }
 }
 
@@ -2668,6 +2704,10 @@ export function createRouting(pi: any, deps: Deps = {}) {
     }
     const envProfile = resolveProfileName(env)
     const profile = parsed.base ? undefined : parsed.profile ?? (envProfile !== undefined && profiles.includes(envProfile) ? envProfile : undefined)
+    if (profile !== undefined && SKIP_KEYS.has(profile)) {
+      ctx.ui.notify(`routing: a profile named "${profile}" cannot be edited here (OMO's config merge skips that key); use --base or rename it`, "error")
+      return
+    }
     const warnings: string[] = []
     if (!parsed.base && !parsed.profile && envProfile !== undefined && !profiles.includes(envProfile))
       warnings.push(`환경이 가리키는 프로필 "${envProfile}"이 omo.jsonc에 없어 base만 편집합니다`)
@@ -2680,25 +2720,35 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const snapshotFile = snapshotPath(home)
     const current = builtinSnapshot(builtin, omo)
     let reviewed = readSnapshot(snapshotFile)
-    // The first open records what is installed now as reviewed, so only later
-    // OMO updates are reported as changes.
-    if (!reviewed && Object.keys(current.sections).length) {
+    // Whatever the snapshot does not cover yet is recorded as reviewed now, so
+    // only later OMO updates count as changes: everything on the first open, a
+    // section that could not be read when the snapshot was taken.
+    const unrecorded = SECTIONS.filter(section => current.sections[section] && !reviewed?.sections[section])
+    if (unrecorded.length) {
+      const recorded: Snapshot = reviewed
+        ? { ...reviewed, sections: { ...reviewed.sections, ...Object.fromEntries(unrecorded.map(section => [section, current.sections[section]])) } }
+        : current
       try {
-        writeSnapshot(snapshotFile, current)
-        reviewed = current
+        writeSnapshot(snapshotFile, recorded)
+        reviewed = recorded
       } catch (error) {
         warnings.push(`빌트인 스냅샷을 쓰지 못해 변경 추적이 꺼집니다: ${errorText(error)}`)
       }
     }
     const levels = await hostThinkingLevels(env)
     const availability = availabilityOf(ctx.modelRegistry)
+    let backedUp = false
     const result = await ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: { saved: number }) => void) => new RoutingEditor({
       raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
       drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
       levels: model => effortLevels(model, levels),
       save: (drafts, confirmExternal) => {
-        const saved = saveConfig({ path: cfgPath, openedText, drafts, confirmExternal })
-        if (saved.status === "saved") openedText = saved.text
+        // .bak keeps the file as it was before this session's first save.
+        const saved = saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp })
+        if (saved.status === "saved") {
+          openedText = saved.text
+          backedUp ||= saved.backup !== undefined
+        }
         return saved
       },
       markReviewed: () => {

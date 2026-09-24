@@ -135,6 +135,45 @@ test("save engine: custom chains replace model/fallback_models in the layer, com
   assert.match(text, /"models": \["a\/b:high", "a\/c"\]/, "an inline array stays inline")
 })
 
+test("save engine: removing entries or keys never takes a neighbour's comment with it", () => {
+  const src = `{
+  "[native]": {
+    "categories": {
+      "quick": { "models": ["a/quick"] }, // quick: cheap on purpose
+      "writing": { "models": ["a/writing"] },
+      // deep: pinned on purpose
+      "deep": {
+        "model": "old/model",
+        // shown in the delegate prompt
+        "description": "Deep work.",
+        "models": ["a/deep"]
+      },
+      "last": { "models": ["a/last"] }
+    }
+  }
+}
+`
+  const text = r.applyDrafts(src, [
+    draft("writing", { chain: null }),
+    draft("last", { chain: null }),
+    draft("deep", { chain: ["a/new"] }),
+  ])
+  for (const comment of ["// quick: cheap on purpose", "// deep: pinned on purpose", "// shown in the delegate prompt"])
+    assert.ok(text.includes(comment), `${comment} survives:\n${text}`)
+  assert.deepEqual(r.parseJsonc(text)["[native]"].categories, {
+    quick: { models: ["a/quick"] },
+    deep: { description: "Deep work.", models: ["a/new"] },
+  })
+  assert.doesNotMatch(text, /^\s*$\n^\s*$/m, "no blank lines are left behind")
+  assert.equal(r.removeJsoncPath(`{ "a": 1, "b": 2, "c": 3 }`, ["b"]), `{ "a": 1, "c": 3 }`, "inline objects stay tidy")
+})
+
+test("the in-memory preview never writes through __proto__", () => {
+  const raw = JSON.parse(`{ "profiles": { "__proto__": { "[native]": {} } } }`)
+  assert.throws(() => r.applyDraftsToConfig(raw, [{ profile: "__proto__", ...draft("deep", { chain: ["z/z"] }) }]), /refusing to edit through the key __proto__/)
+  assert.equal(({})["[native]"], undefined, "Object.prototype stays clean")
+})
+
 test("save engine: follow drops routing keys, keeps descriptions and removes emptied entries", () => {
   const raw = r.parseJsonc(r.applyDrafts(SRC, [
     draft("implementer", { chain: null }),

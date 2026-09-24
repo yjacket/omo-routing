@@ -181,4 +181,11 @@ test("kitty CSI-u letters work; ctrl/alt chords are never read as letters", () =
   assert.equal(editor.pending().length, 1, "ctrl+u / alt+u are ignored")
   press(editor, "\x1b[117u")
   assert.equal(editor.pending().length, 0, "plain u undoes")
+  press(editor, KEY.enter)
+  assert.match(screen(editor), /writing · base 편집/)
+  press(editor, "\x1b[127;3u", "\x1b[127;5u", "\b", "\x1b[13;5u", "\x1b[9;5u")
+  assert.equal(editor.pending().length, 0, "alt/ctrl+Backspace, legacy ^H, ctrl+Enter and ctrl+Tab do nothing")
+  press(editor, "a", ..."opus", KEY.enter, KEY.enter, "\x1b[27;2;75~")
+  assert.deepEqual(editor.pending()[0].chain, ["anthropic-subscription/claude-opus:high", "anthropic-subscription/claude-fable:low"],
+    "xterm modifyOtherKeys shift+K moves the rung up")
 })

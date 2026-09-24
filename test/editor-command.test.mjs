@@ -158,6 +158,35 @@ test("an unreadable builtin table still opens the editor with configured chains 
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(h.snapshot, "utf8")).sections), ["model_profiles"],
     "only the readable section is recorded as reviewed")
   assert.equal(readFileSync(h.cfgPath, "utf8"), CONFIG)
+
+  // Once readable, the section is recorded silently; a later change is reported.
+  const task = join(h.home, "omo-ai", "plugin", "extensions", "omo-task.js")
+  writeFileSync(task, TASK)
+  const second = await h.open("edit --base")
+  assert.doesNotMatch(screen(second.editor), /빌트인 변경 \(/)
+  press(second.editor, "q")
+  await second.finished
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(h.snapshot, "utf8")).sections).sort(), ["agents", "categories", "model_profiles"])
+  writeFileSync(task, TASK.replace('model:"gpt-mini"', 'model:"gpt-new"'))
+  const third = await h.open("edit --base")
+  assert.match(screen(third.editor), /빌트인 변경 \(OMO 9\.9\.9-test에서 확인한 뒤\): 변경 1 \(quick\)/)
+  press(third.editor, "q")
+  await third.finished
+})
+
+test("a profile named __proto__ is refused, and .bak keeps the file from before the session's first save", async t => {
+  const odd = setup(t, { config: `{ "profiles": { "__proto__": { "[native]": {} } } }` })
+  await odd.run("edit -p __proto__")
+  assert.match(odd.notes.at(-1).message, /a profile named "__proto__" cannot be edited here/)
+  assert.equal(({})["[native]"], undefined)
+
+  const h = setup(t)
+  const { editor, finished } = await h.open("edit --base")
+  select(editor, "deep")
+  press(editor, "x", "s", "x", "s", "q")
+  await finished
+  assert.equal(readFileSync(`${h.cfgPath}.bak`, "utf8"), CONFIG, "the second save did not overwrite the pre-session backup")
+  assert.match(h.notes.at(-1).message, /^routing: saved 2 change\(s\)/)
 })
 
 test("/routing help lists the edit form and the hint names it", async t => {
