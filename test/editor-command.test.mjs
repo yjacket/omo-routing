@@ -105,15 +105,19 @@ test("/routing edit refuses outside the TUI and on bad arguments; nothing is wri
 test("a missing omo.jsonc is created on save, and --base edits base alone", async t => {
   const h = setup(t, { config: null })
   assert.ok(!existsSync(h.cfgPath))
+  writeFileSync(`${h.cfgPath}.bak`, "an unrelated backup from an older session")
   const { editor, finished } = await h.open("edit --base")
   assert.doesNotMatch(screen(editor), /Tab 전환/)
   select(editor, "deep")
   // s saves from the chain view too; q there steps back to the list, then closes.
-  press(editor, KEY.enter, "a", ..."haiku", KEY.enter, KEY.enter, "s", "q", "q")
-  await finished
+  press(editor, KEY.enter, "a", ..."haiku", KEY.enter, KEY.enter, "s")
   assert.deepEqual(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.deep.models, ["chatgpt-subscription/gpt-big:high", "anthropic-subscription/claude-haiku"])
-  assert.ok(!existsSync(`${h.cfgPath}.bak`))
-  assert.match(h.notes.at(-1).message, /^routing: saved 1 change\(s\) to .*omo\.jsonc; \/reload to apply$/)
+  press(editor, "d", "s", "q", "q")
+  await finished
+  assert.deepEqual(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.deep.models, ["chatgpt-subscription/gpt-big:high"])
+  assert.equal(readFileSync(`${h.cfgPath}.bak`, "utf8"), "an unrelated backup from an older session",
+    "no file existed before this session, so no save backs anything up over the old .bak")
+  assert.match(h.notes.at(-1).message, /^routing: saved 2 change\(s\) to .*omo\.jsonc; \/reload to apply$/, "and the notice cites no backup")
 })
 
 test("reports show builtin changes since the last review and project configs, and never write the snapshot", async t => {

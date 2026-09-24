@@ -1,7 +1,7 @@
 // The /routing edit overlay driven by key presses, as pi-tui delivers them.
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { availabilityOf } from "../extension/routing.ts"
+import { availabilityOf, decodeKey } from "../extension/routing.ts"
 import { KEY, cells, makeEditor, press, screen, select, strip } from "./editor-fixture.mjs"
 
 const row = (text, label) => text.split("\n").find(line => line.startsWith(`▸ ${label} `) || line.startsWith(`  ${label} `))
@@ -183,9 +183,18 @@ test("kitty CSI-u letters work; ctrl/alt chords are never read as letters", () =
   assert.equal(editor.pending().length, 0, "plain u undoes")
   press(editor, KEY.enter)
   assert.match(screen(editor), /writing · base 편집/)
-  press(editor, "\x1b[127;3u", "\x1b[127;5u", "\b", "\x1b[13;5u", "\x1b[9;5u")
-  assert.equal(editor.pending().length, 0, "alt/ctrl+Backspace, legacy ^H, ctrl+Enter and ctrl+Tab do nothing")
+  press(editor, "\x1b[127;3u", "\x1b[127;5u", "\x1b[13;5u", "\x1b[9;5u")
+  assert.equal(editor.pending().length, 0, "alt/ctrl+Backspace, ctrl+Enter and ctrl+Tab do nothing")
   press(editor, "a", ..."opus", KEY.enter, KEY.enter, "\x1b[27;2;75~")
   assert.deepEqual(editor.pending()[0].chain, ["anthropic-subscription/claude-opus:high", "anthropic-subscription/claude-fable:low"],
     "xterm modifyOtherKeys shift+K moves the rung up")
+  press(editor, "\x1b[127;129u")
+  assert.deepEqual(editor.pending()[0].chain, ["anthropic-subscription/claude-fable:low"], "Backspace with Num Lock on still removes")
+  press(editor, KEY.esc, "\x1b[9;65u")
+  assert.match(screen(editor), /편집할 프로필이 없어 base만 편집합니다/, "Tab with Caps Lock on is still Tab")
+})
+
+test("^H is Backspace except under Windows Terminal, which sends it for ctrl+Backspace", () => {
+  assert.equal(decodeKey("\b", undefined, {}), "backspace")
+  assert.equal(decodeKey("\b", undefined, { WT_SESSION: "1" }), undefined)
 })

@@ -1815,7 +1815,7 @@ const RAW_KEYS: Record<string, string> = {
   "\x1b[1;2A": "shift-up", "\x1b[1;2B": "shift-down",
   "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
   "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end",
-  // No "\b": legacy terminals send it for ctrl+Backspace.
+  // "\b" is decided in decodeKey (Windows Terminal sends it for ctrl+Backspace).
   "\r": "enter", "\n": "enter", "\x1b": "esc", "\t": "tab", "\x7f": "backspace", "\x1b[3~": "delete",
 }
 const SELECT_BINDINGS = [
@@ -1829,8 +1829,11 @@ type KeyMatcher = { matches?(data: string, id: string): boolean }
 /** One key press as the editor names it (`up`, `enter`, `ch:a`, ...), from legacy,
  * xterm or kitty (CSI u) sequences; the host's select keybindings count too.
  * Printable keys held with ctrl/alt/super are ignored, never read as letters. */
-export function decodeKey(data: string, keybindings?: KeyMatcher): string | undefined {
+export function decodeKey(data: string, keybindings?: KeyMatcher, env: Record<string, string | undefined> = process.env): string | undefined {
   if (Object.hasOwn(RAW_KEYS, data)) return RAW_KEYS[data]
+  // ^H is Backspace, except under Windows Terminal, which sends it for
+  // ctrl+Backspace (pi-tui reads it the same way).
+  if (data === "\b") return env.WT_SESSION ? undefined : "backspace"
   for (const [id, key] of SELECT_BINDINGS) {
     try {
       if (keybindings?.matches?.(data, id)) return key
@@ -1843,7 +1846,8 @@ export function decodeKey(data: string, keybindings?: KeyMatcher): string | unde
     : data.startsWith("\x1b[") ? /^(\d+)(?::\d+)*(?:;(\d+)(?::\d+)*)?u$/.exec(data.slice(2))?.slice(1) : undefined
   if (csi) {
     const code = Number(csi[0])
-    const modifiers = Number(csi[1] ?? "1") - 1
+    // Caps Lock (64) and Num Lock (128) are not held keys; pi-tui masks them too.
+    const modifiers = (Number(csi[1] ?? "1") - 1) & ~(64 | 128)
     // Held ctrl/alt/super never edit: ctrl+Backspace is not Backspace.
     if ((modifiers & ~1) !== 0) return undefined
     if (CSI_U_KEYS[code]) return CSI_U_KEYS[code]
@@ -2738,6 +2742,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const levels = await hostThinkingLevels(env)
     const availability = availabilityOf(ctx.modelRegistry)
     let backedUp = false
+    let backupPath: string | undefined
     const result = await ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: { saved: number }) => void) => new RoutingEditor({
       raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
       drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
@@ -2747,7 +2752,9 @@ export function createRouting(pi: any, deps: Deps = {}) {
         const saved = saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp })
         if (saved.status === "saved") {
           openedText = saved.text
-          backedUp ||= saved.backup !== undefined
+          // After the first save the pre-session file is in .bak, or there was none.
+          backedUp = true
+          backupPath ??= saved.backup
         }
         return saved
       },
@@ -2762,7 +2769,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     }, theme, keybindings), { overlay: true, overlayOptions: { ...EDITOR_OVERLAY } })
     const saved = typeof result?.saved === "number" ? result.saved : 0
     if (!saved) return
-    const backup = existsSync(`${cfgPath}.bak`) ? ` (previous version: ${cfgPath}.bak)` : ""
+    const backup = backupPath ? ` (previous version: ${backupPath})` : ""
     ctx.ui.notify(`routing: saved ${saved} change(s) to ${cfgPath}${backup}; /reload to apply`, "info")
     if (shown && lastView) {
       const text = findConfig()
