@@ -25,6 +25,7 @@ import { createHash } from "node:crypto"
 import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 import { createContext, runInContext } from "node:vm"
+import { isDeepStrictEqual } from "node:util"
 
 /** `cwd` is where OMO looks for project `.omo/omo.jsonc` files (default: ctx.cwd). */
 export type Deps = { env?: Record<string, string | undefined>; home?: string; cwd?: string }
@@ -1129,6 +1130,80 @@ export function applyDraftsToConfig(raw: any, drafts: readonly EditorDraft[]): a
   return out
 }
 
+const ROUTING_KEYS = ["model_profile", "model_profiles", "categories", "agents"] as const
+
+/** The configured routing of an effective config, copied verbatim. */
+const pickRouting = (config: unknown): Record<string, unknown> => {
+  const out: Record<string, unknown> = {}
+  for (const key of ROUTING_KEYS) if (record(config) && Object.hasOwn(config, key)) out[key] = cloneValue(config[key])
+  return out
+}
+
+const ownValue = (value: unknown, key: string): unknown => (record(value) && Object.hasOwn(value, key) ? value[key] : undefined)
+
+/** Path of the first difference between two values, undefined when equal. */
+function firstDifference(want: unknown, got: unknown, path = ""): string | undefined {
+  if (isDeepStrictEqual(want, got)) return undefined
+  if (record(want) && record(got))
+    for (const key of new Set([...Object.keys(want), ...Object.keys(got)])) {
+      const found = firstDifference(ownValue(want, key), ownValue(got, key), path ? `${path}.${key}` : key)
+      if (found) return found
+    }
+  return path || "(root)"
+}
+
+/** Why `name` cannot become a new profile of `raw`, or undefined. `name` must
+ * already be trimmed. Duplicates are exact: profile names are JSON keys. */
+export function validateProfileName(name: string, raw: unknown): string | undefined {
+  if (!name) return "프로필 이름을 입력하세요"
+  if (SKIP_KEYS.has(name) || HARNESS_KEYS.has(name)) return `"${name}"은 예약된 이름이라 쓸 수 없습니다`
+  if (/[\s/\\\p{Cc}]/u.test(name)) return "프로필 이름에는 공백, 제어 문자, / 와 \\ 를 쓸 수 없습니다"
+  if (!record(raw)) return "omo.jsonc의 최상위가 객체가 아니라 프로필을 추가할 수 없습니다"
+  if (Object.hasOwn(raw, "profiles") && !isObj(raw.profiles)) return "omo.jsonc의 profiles가 객체가 아니라 프로필을 추가할 수 없습니다"
+  if (profileNames(raw).includes(name)) return `프로필 "${name}"이 이미 있습니다`
+  return undefined
+}
+
+/** Why a profile holding `routing` would not resolve to exactly `routing` once
+ * added to `raw` (an overlay cannot delete what base sets), or undefined. */
+function snapshotMismatch(raw: unknown, name: string, routing: Record<string, unknown>): string | undefined {
+  const applied = applyProfile(raw, name)
+  const difference = applied.profile === name ? firstDifference(routing, pickRouting(applied.config)) : "(profile)"
+  return difference === undefined ? undefined
+    : `프로필로 표현할 수 없습니다 (${difference}): base에 남아 있는 설정이 이 프로필에서 지워지지 않습니다. 변경을 base에 먼저 저장하거나 u로 취소하세요`
+}
+
+const withProfile = (raw: Record<string, unknown>, name: string, routing: Record<string, unknown>): Record<string, unknown> =>
+  ({ ...raw, profiles: { ...(record(raw.profiles) ? raw.profiles : {}), [name]: { "[native]": routing } } })
+
+/** The configured routing the editor shows for `profile` (undefined: base)
+ * with `drafts` applied, as the content of a new profile: model_profile,
+ * model_profiles, categories and agents of the merged config, verbatim (hidden
+ * providers, metadata and object rungs included, no builtin default added).
+ * Never touches `raw`. */
+export function snapshotRouting(raw: unknown, drafts: readonly EditorDraft[], profile: string | undefined): { routing: Record<string, unknown> } | { error: string } {
+  let routing: Record<string, unknown>
+  try {
+    routing = pickRouting(applyProfile(applyDraftsToConfig(raw, drafts), profile).config)
+  } catch (error) {
+    return { error: errorText(error) }
+  }
+  const error = snapshotMismatch(withProfile(record(raw) ? raw : {}, "\u0000snapshot", routing), "\u0000snapshot", routing)
+  return error ? { error } : { routing }
+}
+
+/** `src` with `profiles.<name>["[native]"] = routing` added and nothing else
+ * changed. The name is checked against `src` itself, and the profile must
+ * resolve to exactly `routing` there; otherwise this throws. */
+export function applySnapshot(src: string, name: string, routing: Record<string, unknown>): string {
+  const invalid = validateProfileName(name, parseJsonc(src))
+  if (invalid) throw new Error(invalid)
+  const next = setJsoncPath(src, ["profiles", name], { "[native]": routing })
+  const mismatch = snapshotMismatch(parseJsonc(next), name, routing)
+  if (mismatch) throw new Error(mismatch)
+  return next
+}
+
 export type SaveResult =
   | { status: "saved"; text: string; count: number; backup?: string }
   | { status: "external-change" }
@@ -1137,7 +1212,7 @@ export type SaveResult =
 /** Write drafts to the config file. `openedText` (the file as the editor read
  * it) guards against silently overwriting an edit made meanwhile; the result
  * must parse, the previous file is kept as `.bak`, a missing file is created. */
-export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean; backup?: boolean }): SaveResult {
+export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean; backup?: boolean; profile?: { name: string; routing: Record<string, unknown> } }): SaveResult {
   const { path, openedText, drafts } = options
   let current: string | undefined
   try {
@@ -1148,7 +1223,7 @@ export function saveConfig(options: { path: string; openedText?: string; drafts:
   if (current !== openedText && !options.confirmExternal) return { status: "external-change" }
   let next: string
   try {
-    next = applyDrafts(current ?? "{\n}\n", drafts)
+    next = options.profile ? applySnapshot(current ?? "{\n}\n", options.profile.name, options.profile.routing) : applyDrafts(current ?? "{\n}\n", drafts)
     parseJsonc(next)
   } catch (error) {
     return { status: "error", message: `refusing to write ${path}: ${errorText(error)}` }
@@ -1483,9 +1558,16 @@ type Confirm = "discard" | "external" | undefined
 type ChainMode = { kind: "chain"; key: string; cursor: number }
 type PickerMode = { kind: "picker"; key: string; rung: number; add: boolean; filter: string; pick: number }
 type EffortMode = { kind: "effort"; key: string; rung: number; action: "add" | "replace" | "effort"; provider: string; model: string; options: string[]; pick: number }
-type EditorMode = { kind: "list" } | ChainMode | PickerMode | EffortMode
+type ProfilesMode = { kind: "profiles"; cursor: number }
+type NameMode = { kind: "name"; text: string }
+/** Confirmation before applying a saved profile: row 0 cancels, row 1 applies. */
+type ApplyMode = { kind: "apply"; name: string; pick: number }
+type EditorMode = { kind: "list" } | ChainMode | PickerMode | EffortMode | ProfilesMode | NameMode | ApplyMode
 type Item = { text: string; color?: string; bold?: boolean; header?: boolean }
 
+/** Bracketed-paste markers a terminal may wrap pasted text in. */
+const PASTE_START = "\x1b[200~"
+const PASTE_END = "\x1b[201~"
 const NO_EFFORT = "(없음)"
 const TONES: Record<Tone, string> = { info: "accent", success: "success", warning: "warning", error: "error" }
 /** Detail pane height: description, builtin, previous builtin, base, profile, effective, two warnings. */
@@ -1502,6 +1584,13 @@ export const EDITOR_RELOAD_VETO = "the /routing editor is open; the reload runs 
 const EDITOR_HEIGHT = 0.8
 const draftKey = (profile: string | undefined, section: Section, name: string): string => `${profile ?? ""}\u0000${section}\u0000${name}`
 
+/** A confirmed request to apply a saved profile: the editor closes with it and
+ * hands over what a reopened editor needs if the host does not reload. */
+export type ApplyRequest = { name: string; drafts: EditorDraft[]; layer?: string }
+export type EditorResult = { saved: number; profiles?: string[]; apply?: ApplyRequest }
+/** What a reopened editor takes over from the one that asked to apply a profile. */
+export type EditorResume = { drafts: readonly EditorDraft[]; layer?: string; saved: number; profiles: readonly string[]; message?: string }
+
 export type EditorOptions = {
   /** The parsed config as opened (or `{}` when there is no file). */
   raw: any
@@ -1515,8 +1604,17 @@ export type EditorOptions = {
   configPath?: string
   levels?: (model: ModelInfo | undefined) => string[]
   save: (drafts: EditorDraft[], confirmExternal: boolean) => SaveResult
+  /** Writes a new profile holding `routing`; the editor's drafts are not part of the file write. */
+  saveProfile?: (name: string, routing: Record<string, unknown>, confirmExternal: boolean) => SaveResult
+  /** Called when applying an existing profile was confirmed: the reason it cannot
+   * be applied right now, or undefined when the editor may close with the request. */
+  selectProfile?: (name: string) => string | undefined
+  /** The profile the running session resolves from its environment, shown in the profile menu. */
+  active?: string
+  /** Pending edits and counters of an editor whose apply request the host did not carry out. */
+  resume?: EditorResume
   markReviewed?: () => Drift
-  done: (result: { saved: number }) => void
+  done: (result: EditorResult) => void
   rows?: () => number
   requestRender?: () => void
 }
@@ -1539,6 +1637,8 @@ export class RoutingEditor {
   private message: { text: string; tone: Tone } | undefined
   private confirm: Confirm
   private saved = 0
+  /** Profiles saved from this editor, in order (not counted in `saved`). */
+  private readonly profilesSaved: string[] = []
   private drift: Drift | undefined
   private version = 0
   private cache: { version: number; nodes: EditorNode[] } | undefined
@@ -1550,6 +1650,14 @@ export class RoutingEditor {
     this.raw = isObj(options.raw) ? options.raw : {}
     this.layer = options.profile
     this.drift = options.drift
+    const resume = options.resume
+    if (resume) {
+      for (const draft of resume.drafts) this.drafts.set(draftKey(draft.profile, draft.section, draft.name), structuredClone(draft))
+      this.layer = resume.layer
+      this.saved = resume.saved
+      this.profilesSaved.push(...resume.profiles)
+      if (resume.message) this.say(resume.message, "warning")
+    }
   }
 
   invalidate(): void {
@@ -1563,9 +1671,15 @@ export class RoutingEditor {
 
   handleInput(data: string): void {
     const mode = this.mode
-    if (mode.kind === "picker" && [...data].length > 1 && [...data].every(char => char >= " " && char !== "\x7f")) {
-      mode.filter += data // pasted text
-      mode.pick = 0
+    // Pasted text, without the bracketed-paste markers a terminal may add.
+    const pasted = data.startsWith(PASTE_START) && data.endsWith(PASTE_END) ? data.slice(PASTE_START.length, -PASTE_END.length) : data
+    if ((mode.kind === "picker" || mode.kind === "name") && [...pasted].length > 1 && [...pasted].every(char => char >= " " && char !== "\x7f")) {
+      this.confirm = undefined
+      this.message = undefined
+      if (mode.kind === "picker") {
+        mode.filter += pasted
+        mode.pick = 0
+      } else mode.text += pasted
     } else {
       const key = decodeKey(data, this.keybindings)
       if (key !== undefined) this.dispatch(key)
@@ -1581,6 +1695,9 @@ export class RoutingEditor {
     if (mode.kind === "list") this.listKey(key, confirm)
     else if (mode.kind === "chain") this.chainKey(key, mode, confirm)
     else if (mode.kind === "picker") this.pickerKey(key, mode)
+    else if (mode.kind === "profiles") this.profilesKey(key, mode)
+    else if (mode.kind === "name") this.nameKey(key, mode, confirm)
+    else if (mode.kind === "apply") this.applyKey(key, mode)
     else this.effortKey(key, mode)
   }
 
@@ -1760,7 +1877,7 @@ export class RoutingEditor {
       this.say(`저장 안 된 변경 ${this.drafts.size}건: q/Esc를 한 번 더 누르면 버리고 닫습니다 (s: 저장)`, "warning")
       return
     }
-    this.options.done({ saved: this.saved })
+    this.options.done({ saved: this.saved, ...(this.profilesSaved.length ? { profiles: [...this.profilesSaved] } : {}) })
   }
 
   private listKey(key: string, confirm: Confirm): void {
@@ -1789,9 +1906,119 @@ export class RoutingEditor {
       case "ch:h": this.toggleHidden(); return
       case "tab": this.switchLayer(); return
       case "ch:c": this.markReviewed(); return
+      case "ch:p": this.mode = { kind: "profiles", cursor: 0 }; return
       case "ch:s": this.save(confirm === "external"); return
       case "ch:q": case "esc": this.close(confirm === "discard"); return
     }
+  }
+
+  /** The profile menu: row 0 saves the current routing as a new profile, then the existing profiles. */
+  private profilesKey(key: string, mode: ProfilesMode): void {
+    const names = profileNames(this.raw)
+    switch (key) {
+      case "up": mode.cursor = Math.max(0, mode.cursor - 1); return
+      case "down": mode.cursor = Math.min(names.length, mode.cursor + 1); return
+      case "home": case "pgup": mode.cursor = 0; return
+      case "end": case "pgdn": mode.cursor = names.length; return
+      case "enter": case "right": {
+        if (mode.cursor === 0) {
+          this.mode = { kind: "name", text: "" }
+          return
+        }
+        const name = names[mode.cursor - 1]
+        if (!this.options.selectProfile) {
+          this.say("이 환경에서는 프로필을 고를 수 없습니다", "warning")
+          return
+        }
+        // Cancel is the default when applying would discard staged edits.
+        this.mode = { kind: "apply", name, pick: this.drafts.size ? 0 : 1 }
+        return
+      }
+      case "esc": case "left": case "ch:q": case "ch:p": this.mode = { kind: "list" }; return
+    }
+  }
+
+  /** Apply confirmation. Only Enter on the apply row asks the host; the editor
+   * closes with the request (staged edits ride along in case the host refuses). */
+  private applyKey(key: string, mode: ApplyMode): void {
+    const back = (): void => { this.mode = { kind: "profiles", cursor: profileNames(this.raw).indexOf(mode.name) + 1 } }
+    switch (key) {
+      case "up": case "down": case "home": case "end": mode.pick = key === "up" || key === "home" ? 0 : 1; return
+      case "esc": case "left": case "ch:q": back(); return
+      case "enter": {
+        if (mode.pick === 0) {
+          back()
+          this.say(`프로필 ${mode.name} 적용을 취소했습니다: 편집 내용과 환경은 그대로입니다`)
+          return
+        }
+        let refusal: string | undefined
+        try {
+          refusal = this.options.selectProfile?.(mode.name)
+        } catch (error) {
+          refusal = errorText(error)
+        }
+        if (refusal) {
+          back()
+          this.say(`프로필 ${mode.name}: ${refusal}`, "error")
+          return
+        }
+        this.options.done({
+          saved: this.saved, ...(this.profilesSaved.length ? { profiles: [...this.profilesSaved] } : {}),
+          apply: { name: mode.name, drafts: this.pending(), ...(this.layer === undefined ? {} : { layer: this.layer }) },
+        })
+      }
+    }
+  }
+
+  private nameKey(key: string, mode: NameMode, confirm: Confirm): void {
+    switch (key) {
+      case "esc": this.mode = { kind: "profiles", cursor: 0 }; return
+      case "backspace": mode.text = [...graphemes.segment(mode.text)].slice(0, -1).map(part => part.segment).join(""); return
+      case "enter": this.saveProfile(mode, confirm === "external"); return
+      default:
+        if (key.startsWith("ch:")) mode.text += key.slice(3)
+    }
+  }
+
+  /** Save the current preview (drafts included) as a new profile. Source layer,
+   * base and the staged drafts stay as they are. */
+  private saveProfile(mode: NameMode, confirmed: boolean): void {
+    const name = mode.text.trim()
+    const invalid = validateProfileName(name, this.raw)
+    if (invalid) {
+      this.say(invalid, "error")
+      return
+    }
+    const snapshot = snapshotRouting(this.raw, this.pending(), this.options.profile)
+    if ("error" in snapshot) {
+      this.say(snapshot.error, "error")
+      return
+    }
+    if (!this.options.saveProfile) {
+      this.say("이 환경에서는 프로필을 저장할 수 없습니다", "warning")
+      return
+    }
+    let result: SaveResult
+    try {
+      result = this.options.saveProfile(name, snapshot.routing, confirmed)
+    } catch (error) {
+      this.say(`저장하지 못했습니다: ${errorText(error)}`, "error")
+      return
+    }
+    if (result.status === "external-change") {
+      this.confirm = "external"
+      this.say("omo.jsonc가 편집기를 연 뒤 바뀌었습니다. Enter를 한 번 더 누르면 지금 파일에 프로필을 추가합니다 (다른 키: 취소)", "warning")
+      return
+    }
+    if (result.status === "error") {
+      this.say(result.message, "error")
+      return
+    }
+    this.raw = parseJsonc(result.text)
+    this.profilesSaved.push(name)
+    this.changed()
+    this.mode = { kind: "profiles", cursor: profileNames(this.raw).indexOf(name) + 1 }
+    this.say(`프로필 "${name}" 저장 완료 · 원본 유지 · Enter 적용`, "success")
   }
 
   private chainKey(key: string, mode: ChainMode, confirm: Confirm): void {
@@ -1978,9 +2205,9 @@ export class RoutingEditor {
     const iw = framed ? w - 4 : w
     const nodes = this.nodes()
     this.cursor = Math.max(0, Math.min(this.cursor, nodes.length - 1))
-    if (this.mode.kind !== "list" && !this.node(this.mode.key)) this.mode = { kind: "list" }
+    if ("key" in this.mode && !this.node(this.mode.key)) this.mode = { kind: "list" }
     const mode = this.mode
-    const focus = mode.kind === "list" ? nodes[this.cursor] : this.node(mode.key)
+    const focus = "key" in mode ? this.node(mode.key) : nodes[this.cursor]
     const height = this.height() - (framed ? 2 : 0)
     // One size while moving around, so the centered overlay never jumps: key
     // help and status get the rows their longest variant needs, the body is as
@@ -1991,7 +2218,7 @@ export class RoutingEditor {
     const header = [...(framed ? [] : [{ text: this.titleText(), color: "accent", bold: true }]), ...this.headerItems(iw)]
     const keyText = this.wrapped(this.keyHelp(mode.kind), iw, "dim")
     const keys = [...keyText]
-    const keyRows = Math.max(...(["list", "chain"] as const).map(kind => this.wrapped(this.keyHelp(kind), iw).length))
+    const keyRows = Math.max(...(["list", "chain", "profiles", "name", "apply"] as const).map(kind => this.wrapped(this.keyHelp(kind), iw).length))
     while (keys.length < keyRows) keys.push({ text: "" })
     const status = this.statusItems(iw)
     while (status.length < 2) status.push({ text: "" })
@@ -2002,7 +2229,8 @@ export class RoutingEditor {
     const room = Math.max(3, height - fixed())
     const body = mode.kind === "list" ? this.listItems(nodes, iw)
       : mode.kind === "chain" ? this.chainItems(focus as EditorNode, mode)
-      : mode.kind === "picker" ? this.pickerItems(mode) : this.effortItems(mode)
+      : mode.kind === "picker" ? this.pickerItems(mode) : mode.kind === "effort" ? this.effortItems(mode)
+      : mode.kind === "profiles" ? this.profileItems(mode) : mode.kind === "apply" ? this.applyItems(mode, iw) : this.nameItems(mode)
     const listLength = mode.kind === "list" ? body.items.length : this.listItems(nodes, iw).items.length
     let detailRows = Math.min(DETAIL_ROWS, Math.floor(room * 0.4), room - 4)
     if (detailRows < 2) detailRows = 0
@@ -2119,13 +2347,19 @@ export class RoutingEditor {
   private keyHelp(kind: EditorMode["kind"]): string {
     switch (kind) {
       case "list":
-        return ["↑↓ 이동", "Enter 체인 편집", "r 기본값 따르기", "x 비활성 전환", "u 변경 취소", "h 미연결 후보",
+        return ["↑↓ 이동", "Enter 체인 편집", "r 기본값 따르기", "x 비활성 전환", "u 변경 취소", "h 미연결 후보", "p 프로필",
           ...(this.options.profile !== undefined ? ["Tab 레이어"] : []), ...(this.drift?.count ? ["c 변경 확인"] : []), "s 저장", "q 닫기"].join(" · ")
       case "chain":
         return ["↑↓ 이동", "a 추가", "Enter 교체/추가", "e effort", "d 삭제", "K/J 위·아래로", "b 빌트인 복사", "r 기본값 따르기",
           "x 비활성", "h 미연결 후보", "u 변경 취소", "s 저장", "Esc 목록"].join(" · ")
       case "picker":
         return "글자 입력: 필터 · Backspace 지우기 · ↑↓ 이동 · Enter 선택 · Esc 취소"
+      case "profiles":
+        return "↑↓ 이동 · Enter 선택 · Esc 목록"
+      case "name":
+        return "이름 입력 (붙여넣기 가능) · Backspace 지우기 · Enter 저장 · Esc 취소"
+      case "apply":
+        return "↑↓ 이동 · Enter 선택 · Esc 취소"
       default:
         return "↑↓ 이동 · Enter 선택 · Esc 취소"
     }
@@ -2134,7 +2368,11 @@ export class RoutingEditor {
   private statusItems(width: number): Item[] {
     const status = this.message
       ?? (this.drafts.size ? { text: `저장 안 된 변경 ${this.drafts.size}건 · s 저장`, tone: "warning" as Tone }
-        : this.saved ? { text: `이번에 저장한 변경 ${this.saved}건 · 편집기를 닫으면 적용됩니다`, tone: "success" as Tone } : undefined)
+        : this.saved || this.profilesSaved.length ? {
+          // Closing reloads saved edits of the active layer; a new profile is only saved until it is applied from p.
+          text: [...(this.saved ? [`변경 ${this.saved}건 저장됨`] : []),
+            ...(this.profilesSaved.length ? [`프로필 ${this.profilesSaved.join(", ")} 저장됨`] : [])].join(" · "), tone: "success" as Tone,
+        } : undefined)
     return status ? this.wrapped(status.text, width, TONES[status.tone]).slice(0, 2) : [{ text: "" }]
   }
 
@@ -2215,6 +2453,51 @@ export class RoutingEditor {
     return { items, focus: models.length ? 1 + mode.pick : 1 }
   }
 
+  private profileItems(mode: ProfilesMode): { items: Item[]; focus: number } {
+    const names = profileNames(this.raw)
+    mode.cursor = Math.min(mode.cursor, names.length)
+    const row = (index: number, text: string): Item => {
+      const selected = index === mode.cursor
+      return { text: `${selected ? "▸" : " "} ${text}`, color: selected ? "accent" : undefined, bold: selected }
+    }
+    const items: Item[] = [{ text: "프로필", bold: true, header: true }, row(0, "+ 새 프로필 저장")]
+    for (const [index, name] of names.entries()) {
+      const tags = [...(name === this.options.profile ? ["편집 중"] : []), ...(name === this.options.active ? ["활성"] : [])]
+      items.push(row(index + 1, `${name}${tags.map(tag => ` · ${tag}`).join("")}`))
+    }
+    return { items, focus: 1 + mode.cursor }
+  }
+
+  private applyItems(mode: ApplyMode, width: number): { items: Item[]; focus: number } {
+    const pending = this.drafts.size
+    const row = (index: number, text: string): Item => {
+      const selected = index === mode.pick
+      return { text: `${selected ? "▸" : " "} ${text}`, color: selected ? "accent" : undefined, bold: selected }
+    }
+    return {
+      items: [
+        { text: `프로필 "${mode.name}" 적용`, bold: true, header: true },
+        row(0, pending ? "취소 (편집 유지)" : "취소"),
+        row(1, pending ? `저장 안 된 변경 ${pending}건 버리고 적용` : "적용"),
+        ...this.wrapped(`현재: ${this.options.active ?? "기본 구성"} → ${mode.name}`, width, "dim"),
+        ...this.wrapped("대화 · 작업 폴더 · 메인 모델 유지", width, "dim"),
+      ],
+      focus: 1 + mode.pick,
+    }
+  }
+
+  private nameItems(mode: NameMode): { items: Item[]; focus: number } {
+    const source = this.options.profile ?? "기본 구성"
+    return {
+      items: [
+        { text: "새 프로필 저장", bold: true, header: true },
+        { text: `프로필 이름: ${mode.text}▏`, color: "accent" },
+        { text: `복사할 구성: ${source}${this.drafts.size ? ` · 편집 ${this.drafts.size}건 포함` : ""}`, color: "dim" },
+      ],
+      focus: 1,
+    }
+  }
+
   private effortItems(mode: EffortMode): { items: Item[]; focus: number } {
     const items: Item[] = [{ text: `effort 선택 · ${labelProvider(mode.provider)}/${mode.model}`, bold: true, header: true }]
     mode.options.forEach((option, index) => {
@@ -2267,8 +2550,50 @@ export function createRouting(pi: any, deps: Deps = {}) {
   // editor with its unsaved edits; the editor holds reloads off until it
   // closes (the host defers and retries, then applies the saved file).
   let editing = false
-  if (typeof pi.on === "function")
+  // Set while a profile apply waits on the host: `session_shutdown` with reason
+  // reload is the only proof the host reloaded (ctx.reload() resolves void when
+  // it refuses because the agent is busy or another extension vetoed).
+  let reloading: { reloaded: boolean } | undefined
+  if (typeof pi.on === "function") {
     pi.on("session_before_reload", async () => editing ? { cancel: true, reason: EDITOR_RELOAD_VETO } : undefined)
+    pi.on("session_shutdown", (event: { reason?: string } | undefined) => {
+      if (reloading && event?.reason === "reload") reloading.reloaded = true
+    })
+  }
+
+  /** Point OMO_PROFILE at `name` and reload the session in place. A refusal
+   * before teardown restores the environment and lets the editor resume. */
+  const applyToHost = async (name: string, ctx: { waitForIdle?: () => Promise<void>; reload: () => Promise<void> }, validate: () => string | undefined): Promise<{ reloaded: true } | { reloaded: false; message: string }> => {
+    const had = Object.hasOwn(env, "OMO_PROFILE")
+    const previous = env.OMO_PROFILE
+    const restoreProfile = (): void => {
+      if (had) env.OMO_PROFILE = previous
+      else delete env.OMO_PROFILE
+    }
+    const watch = { reloaded: false }
+    // Keep automatic reloads from retiring this command while it waits for idle.
+    editing = true
+    try {
+      await ctx.waitForIdle?.()
+      const refusal = validate()
+      if (refusal) return { reloaded: false, message: refusal }
+      env.OMO_PROFILE = name
+      reloading = watch
+      editing = false
+      await ctx.reload()
+    } catch (error) {
+      // The host got as far as tearing the old session down: nothing to restore on a dead runner.
+      if (watch.reloaded) throw error
+      restoreProfile()
+      return { reloaded: false, message: `다시 불러오지 못했습니다: ${errorText(error)} (환경과 편집 내용은 그대로)` }
+    } finally {
+      reloading = undefined
+      editing = false
+    }
+    if (watch.reloaded) return { reloaded: true }
+    restoreProfile()
+    return { reloaded: false, message: "호스트가 다시 불러오기를 하지 않았습니다 (응답 또는 압축 중이거나 다른 확장이 막음): 환경과 편집 내용은 그대로입니다" }
+  }
 
   const omoDir = join(home, ".omo")
   const findConfig = () => ["omo.jsonc", "omo.json"].map((f) => join(omoDir, f)).find((p) => existsSync(p))
@@ -2339,21 +2664,43 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const availability = availabilityOf(ctx.modelRegistry)
     let backedUp = false
     let backupPath: string | undefined
-    const open = () => ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: { saved: number }) => void) => new RoutingEditor({
+    // After a write the file is the new baseline, and the pre-session file is
+    // in .bak (or there was none); later writes keep that backup.
+    const written = (saved: SaveResult): SaveResult => {
+      if (saved.status === "saved") {
+        openedText = saved.text
+        backedUp = true
+        backupPath ??= saved.backup
+      }
+      return saved
+    }
+    /** Why `name` cannot be applied now, judged on the file as it is on disk. */
+    const applyRefusal = (name: string): string | undefined => {
+      if (typeof ctx.reload !== "function") return "이 OMO에는 다시 불러오기(reload) API가 없어 적용할 수 없습니다: 편집 내용은 그대로입니다"
+      if (SKIP_KEYS.has(name) || HARNESS_KEYS.has(name) || resolveProfileName({ OMO_PROFILE: name }) !== name)
+        return `"${name}"은 프로필 이름으로 쓸 수 없어 적용하지 않습니다`
+      let disk: unknown
+      try {
+        disk = existsSync(cfgPath) ? parseJsonc(readFileSync(cfgPath, "utf8")) : undefined
+      } catch (error) {
+        return `omo.jsonc를 읽지 못했습니다: ${errorText(error)}`
+      }
+      const profiles = record(disk) && Object.hasOwn(disk, "profiles") ? disk.profiles : undefined
+      if (!record(profiles) || !Object.hasOwn(profiles, name) || !record(profiles[name]))
+        return `프로필 "${name}"이 omo.jsonc에 없거나 객체가 아닙니다: 환경과 편집 내용은 그대로입니다`
+      return undefined
+    }
+    const open = (resume?: EditorResume) => ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: EditorResult) => void) => new RoutingEditor({
       raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
+      active: resolveProfileName(env), resume, selectProfile: applyRefusal,
       drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
       levels: model => effortLevels(model, levels),
       save: (drafts, confirmExternal) => {
         // .bak keeps the file as it was before this session's first save.
-        const saved = saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp })
-        if (saved.status === "saved") {
-          openedText = saved.text
-          // After the first save the pre-session file is in .bak, or there was none.
-          backedUp = true
-          backupPath ??= saved.backup
-        }
-        return saved
+        return written(saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp }))
       },
+      saveProfile: (name, routing, confirmExternal) =>
+        written(saveConfig({ path: cfgPath, openedText, drafts: [], profile: { name, routing }, confirmExternal, backup: !backedUp })),
       markReviewed: () => {
         reviewed = mergeSnapshot(reviewed, current)
         writeSnapshot(snapshotFile, reviewed)
@@ -2363,16 +2710,32 @@ export function createRouting(pi: any, deps: Deps = {}) {
       rows: () => tui?.terminal?.rows ?? 30,
       requestRender: () => tui?.requestRender?.(),
     }, theme, keybindings), { overlay: true, overlayOptions: { ...EDITOR_OVERLAY } })
-    let result: any
-    editing = true
-    try {
-      result = await open()
-    } finally {
-      editing = false
+    let result: EditorResult | undefined
+    let resume: EditorResume | undefined
+    for (;;) {
+      editing = true
+      try {
+        result = await open(resume)
+      } finally {
+        editing = false
+      }
+      const request = result?.apply
+      if (!result || !request) break
+      // The overlay is closed, so this extension's own reload veto is off. The
+      // file may have changed since the confirmation: check it again before the environment moves.
+      const refusal = applyRefusal(request.name)
+      const outcome = refusal ? { reloaded: false as const, message: refusal } : await applyToHost(request.name, ctx, () => applyRefusal(request.name))
+      // A reloaded host has replaced this extension runner: touch nothing of it.
+      if (outcome.reloaded) return
+      raw = openedText === undefined ? {} : parseJsonc(openedText)
+      resume = { drafts: request.drafts, layer: request.layer, saved: result.saved, profiles: result.profiles ?? [], message: `프로필 ${request.name} 적용 안 됨: ${outcome.message}` }
     }
     const saved = typeof result?.saved === "number" ? result.saved : 0
-    if (!saved) return
+    const profilesSaved: string[] = Array.isArray(result?.profiles) ? result.profiles : []
     const backup = backupPath ? ` (previous version: ${backupPath})` : ""
+    if (profilesSaved.length)
+      ctx.ui.notify(`routing: saved new profile(s) ${profilesSaved.join(", ")} to ${cfgPath}${backup}; the active profile is unchanged (apply it from p in /routing)`, "info")
+    if (!saved) return
     ctx.ui.notify(`routing: saved ${saved} change(s) to ${cfgPath}${backup}; OMO hot-reloads it now that the editor is closed (/reload if hot reload is off)`, "info")
   }
 

@@ -69,7 +69,10 @@ picked (removing, reordering and effort changes still work).
 
 | View | Keys (also shown in the footer) |
 | --- | --- |
-| list | ↑↓ PgUp PgDn Home End move · Enter/→ open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `s` save · `q`/Esc close |
+| list | ↑↓ PgUp PgDn Home End move · Enter/→ open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `p` profile menu · `s` save · `q`/Esc close |
+| profile menu | ↑↓ PgUp PgDn Home End · Enter/→ on `+ 새 프로필 저장` enters a name, on a profile asks to apply it · Esc/←/`q`/`p` back |
+| apply confirmation | ↑↓ Home End pick cancel or apply · Enter confirm · Esc/←/`q` back to the menu |
+| profile name | type the name · Backspace · Enter save · Esc back to the menu |
 | chain | ↑↓ move · `a` add after the cursor (Enter on `+ 모델 추가` too) · Enter replace the model · `e` effort · `d`/Delete/Backspace remove · `K`/`J` or Shift+↑/↓ move · `b` copy the builtin chain · `r` follow · `x` disable · `h` hidden · `u` undo · `s` save · Esc/←/`q` back |
 | model picker | type to filter (every word must match the provider, id or name) · Backspace · ↑↓ · Enter pick · Esc cancel |
 | effort | ↑↓ · Enter · Esc; `(없음)` means no `:effort` suffix |
@@ -86,6 +89,8 @@ A node without a chain in the edited layer is shown with the chain it inherits
 the layer's own chain. `r` (follow) removes the layer's chain instead, so the
 node tracks base or OMO's builtin, including future OMO updates, which a copied
 chain (`b`) does not. A node without a builtin cannot lose its last model.
+`r` and `x` are independent: following drops only the chain and leaves
+`disable` as it is, and toggling `disable` keeps the chain.
 
 ### Labels
 
@@ -127,6 +132,61 @@ would close the editor and drop unsaved edits, so while the editor is open it
 holds reloads off (OMO shows `Hot-reload deferred: the /routing editor is
 open; ...`), and the saved changes are applied as soon as it closes; with OMO's
 hot reload turned off, `/reload` applies them. The closing notice says so.
+
+### Saving as a new profile
+
+`p` opens the profile menu: `+ 새 프로필 저장` (save as a new profile) first,
+then the existing profiles. Enter on the first row asks for a name; Enter on an
+existing profile asks whether to apply it (see below). The name is
+trimmed and must be new (an exact key match counts as taken), nonempty, free
+of whitespace, control characters, `/` and `\`, and not a reserved key such as
+`__proto__` or `[native]`. A `profiles` value that isn't an object is refused.
+
+The new profile gets a `[native]` holding the configured routing the editor
+shows as the effective result of the profile it was opened for (the current
+or `-p` profile, or base alone), staged edits included, even while Tab has
+base open: `model_profile`,
+`model_profiles`, `categories` and `agents` of the merged config, verbatim.
+Rungs of hidden providers and keys such as `description` are copied too.
+Builtin chains are not copied, so a node without a configured chain keeps
+following OMO's builtin, including later OMO updates. An empty result is a
+valid profile that simply follows base and the builtins. A profile overlay
+can't delete what base sets, so a snapshot that wouldn't resolve to exactly
+the shown routing (say, a staged follow of a chain base keeps) is refused with
+the first differing path; save that edit to base first, or undo it with `u`.
+
+Only the new profile is written. Base, the source profile and your staged
+edits stay as they were, so `s` still saves those edits to their own layer.
+The save shares the editor's write rules: comments and formatting are kept,
+the first write of the session leaves `omo.jsonc.bak`, and if the file changed
+on disk since the editor opened, the first Enter warns and a second Enter adds
+the profile to the newer file (any other key cancels). The menu then lists the
+new profile, and the closing notice names it. Saving doesn't activate it:
+the active profile stays the same until you apply one.
+
+### Applying a profile
+
+Enter on an existing profile in the `p` menu opens a confirmation showing the
+active profile and the one to apply. Pick cancel or apply with ↑↓ and press
+Enter; Esc goes back to the menu. Cancel leaves your edits and the environment
+alone. With unsaved edits, cancel is preselected and the apply row says how
+many edits it discards; they're dropped, never written.
+
+Applying sets `OMO_PROFILE` to that profile, closes the editor and asks OMO to
+reload the session in place. This is a profile apply plus reload, not a
+process restart (a deliberate choice): the conversation, the working
+directory and the current session's main model stay as they are, while OMO
+re-reads the selected profile's settings. The profile's `model_profile` takes
+effect where OMO reads it, not by switching the model this session is
+already using.
+
+Only a reload the host actually performs counts. If the profile is missing
+or unsafe in the current file, the host lacks a reload API, the reload is
+vetoed or deferred (a response or compaction in progress, another
+extension), or it fails before the old runtime is torn down, `OMO_PROFILE` goes back to its previous value and the
+editor reopens with your unsaved edits intact and a notice saying why.
+If the host fails after teardown has started, its error is surfaced instead;
+the old editor can no longer be restored and the selected profile remains set.
 
 ### Builtin changes
 
@@ -222,8 +282,9 @@ themselves, so an OMO upgrade that changes their shape fails it.
   recognizable table shapes. Bare Senpi or a future incompatible bundle gets
   configured chains only, with a warning for the affected sections, not
   guessed defaults.
-- The editor's save is the only write to omo.jsonc: it touches only `model`,
-  `models`, `fallback_models` and `disable` of the nodes you changed, and
-  entries it leaves empty. It also writes `~/.omo/routing-builtin-snapshot.json`.
-  Provider state is never touched. Switching profiles is not offered: the
-  profile is fixed by the environment when the host starts.
+- The editor's saves are the only writes to omo.jsonc: `s` touches only
+  `model`, `models`, `fallback_models` and `disable` of the nodes you changed,
+  and entries it leaves empty; saving a new profile only adds
+  `profiles.<name>`. It also writes `~/.omo/routing-builtin-snapshot.json`.
+  Provider state is never touched. Applying a profile writes nothing; it
+  only sets `OMO_PROFILE` for this process and reloads.

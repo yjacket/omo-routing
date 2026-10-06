@@ -319,3 +319,121 @@ test("projectConfigs: routing-setting project files from cwd up to, not includin
   assert.match(r.projectNotice(found[0]), /읽지 못했습니다/)
   assert.ok(!existsSync(join(home, "work", "proj", "sub", "deeper")))
 })
+
+const SNAP = `{
+  // keep
+  "[native]": { "categories": {
+    "deep":    { "models": ["anthropic-subscription/claude-opus:high"] },
+    "writing": { "models": ["a/w"] } } },
+  "profiles": { "work": { "[native]": { "model_profile": "capable" } } }
+}
+`
+const withoutProfile = (raw, name) => {
+  const copy = structuredClone(raw)
+  delete copy.profiles[name]
+  return copy
+}
+const SNAP_DRAFTS = [
+  { profile: "work", section: "categories", name: "quick", chain: ["devin/swe-2-high"], disable: null },
+  { section: "categories", name: "deep", chain: ["a/b:high"], disable: null },
+  { profile: "work", section: "categories", name: "writing", chain: null, disable: true },
+]
+
+test("snapshot: the new profile resolves to the editor's preview, drafts on both layers included; source, base and comments stay", () => {
+  const before = r.parseJsonc(SNAP)
+  const snapshot = r.snapshotRouting(before, SNAP_DRAFTS, "work")
+  assert.deepEqual(snapshot.routing, {
+    model_profile: "capable",
+    categories: { deep: { models: ["a/b:high"] }, quick: { models: ["devin/swe-2-high"] }, writing: { models: ["a/w"], disable: true } },
+  })
+  assert.deepEqual(before, r.parseJsonc(SNAP), "the input config is not mutated")
+  const after = r.applySnapshot(SNAP, "frozen", snapshot.routing)
+  assert.match(after, /\/\/ keep/)
+  const parsed = r.parseJsonc(after)
+  assert.deepEqual(withoutProfile(parsed, "frozen"), before, "base and the source profile are byte-for-byte what they were, as data")
+  assert.deepEqual(parsed.profiles.frozen, { "[native]": snapshot.routing })
+  const preview = r.applyProfile(r.applyDraftsToConfig(before, SNAP_DRAFTS), "work").config
+  const resolved = r.applyProfile(parsed, "frozen").config
+  for (const key of ["model_profile", "model_profiles", "categories", "agents"]) assert.deepEqual(resolved[key], preview[key], key)
+  // Viewing base (Tab) snapshots the base preview: the work-only draft stays out of it.
+  const base = r.snapshotRouting(before, SNAP_DRAFTS, undefined)
+  assert.deepEqual(base.routing.categories, { deep: { models: ["a/b:high"] }, writing: { models: ["a/w"] } })
+  assert.equal(base.routing.model_profile, undefined)
+})
+
+test("snapshot: hidden providers, metadata and object rungs are copied verbatim; nothing builtin is materialized; empty routing is valid", () => {
+  const raw = {
+    "[native]": { agents: { librarian: { description: "d", models: [{ model: "kimi/k3", variant: "high" }, "nowhere/ghost:max"] } }, model_profiles: { capable: { models: ["kimi/k3:high"] } } },
+    categories: { deep: { fallback_models: ["x/y"] } },
+  }
+  const { routing } = r.snapshotRouting(raw, [], undefined)
+  assert.deepEqual(routing, {
+    model_profiles: { capable: { models: ["kimi/k3:high"] } },
+    categories: { deep: { fallback_models: ["x/y"] } },
+    agents: { librarian: { description: "d", models: [{ model: "kimi/k3", variant: "high" }, "nowhere/ghost:max"] } },
+  })
+  const text = r.applySnapshot("{\n}\n", "empty", {})
+  assert.deepEqual(r.parseJsonc(text), { profiles: { empty: { "[native]": {} } } })
+  assert.deepEqual(r.snapshotRouting({}, [], undefined), { routing: {} })
+})
+
+test("snapshot: a removal an overlay cannot express is refused, never approximated", () => {
+  const raw = r.parseJsonc(SNAP)
+  const follow = [{ section: "categories", name: "deep", chain: null, disable: null }]
+  const refused = r.snapshotRouting(raw, follow, undefined)
+  assert.match(refused.error, /프로필로 표현할 수 없습니다 \(categories\.deep\)/)
+  // The same check guards the write itself, against the text as it is then.
+  assert.throws(() => r.applySnapshot(SNAP, "gone", { categories: { writing: { models: ["a/w"] } } }), /표현할 수 없습니다/)
+})
+
+test("validateProfileName: trimmed, no reserved keys, separators, whitespace, controls, duplicates or broken containers", () => {
+  const raw = r.parseJsonc(SNAP)
+  for (const bad of ["", "__proto__", "constructor", "prototype", "[native]", "[senpi]", "a/b", "a\\b", "a b", " a", "a\tb", "a\u0001", "a\u009b", "work"])
+    assert.ok(r.validateProfileName(bad, raw), JSON.stringify(bad))
+  for (const good of ["frozen", "WORK", "작업복사본", "a.b", "-x"]) assert.equal(r.validateProfileName(good, raw), undefined, good)
+  for (const profiles of [[], null, "x", 3]) {
+    const broken = { profiles }
+    assert.match(r.validateProfileName("new", broken), /profiles가 객체가 아니라/)
+    assert.throws(() => r.applySnapshot(JSON.stringify(broken), "new", {}), /profiles가 객체가 아니라/)
+  }
+  assert.throws(() => r.applySnapshot(SNAP, "work", {}), /이미 있습니다/)
+})
+
+test("saveConfig profile: external-change guard, one pre-session .bak, duplicates revalidated on the file itself, missing file created", t => {
+  const dir = temp(t)
+  const path = join(dir, "omo.jsonc")
+  writeFileSync(path, SNAP)
+  const outside = SNAP.replace("// keep", "// edited elsewhere")
+  writeFileSync(path, outside)
+  const routing = { categories: { deep: { models: ["anthropic-subscription/claude-opus:high"] }, writing: { models: ["a/w"] } } }
+  const profile = { name: "frozen", routing }
+  assert.deepEqual(r.saveConfig({ path, openedText: SNAP, drafts: [], profile }), { status: "external-change" })
+  assert.equal(readFileSync(path, "utf8"), outside, "nothing written before confirmation")
+  assert.ok(!existsSync(path + ".bak"))
+  // Someone added the same name meanwhile: the confirmed write refuses and leaves the file as it is.
+  const taken = outside.replace('"work":', '"frozen": { "[native]": {} }, "work":')
+  writeFileSync(path, taken)
+  const clash = r.saveConfig({ path, openedText: SNAP, drafts: [], profile, confirmExternal: true })
+  assert.equal(clash.status, "error")
+  assert.match(clash.message, /프로필 "frozen"이 이미 있습니다/)
+  assert.equal(readFileSync(path, "utf8"), taken)
+  assert.ok(!existsSync(path + ".bak"), "a refused write backs nothing up")
+  writeFileSync(path, outside)
+  const saved = r.saveConfig({ path, openedText: SNAP, drafts: [], profile, confirmExternal: true })
+  assert.equal(saved.status, "saved")
+  assert.equal(saved.count, 0)
+  assert.equal(readFileSync(path + ".bak", "utf8"), outside)
+  assert.match(readFileSync(path, "utf8"), /edited elsewhere/)
+  const second = r.saveConfig({ path, openedText: saved.text, drafts: [], profile: { name: "again", routing }, backup: false })
+  assert.equal(second.status, "saved")
+  assert.equal(readFileSync(path + ".bak", "utf8"), outside, "backup: false keeps the pre-session file")
+  assert.deepEqual(Object.keys(r.parseJsonc(readFileSync(path, "utf8")).profiles), ["work", "frozen", "again"])
+
+  const created = join(dir, ".omo", "omo.jsonc")
+  assert.equal(r.saveConfig({ path: created, drafts: [], profile: { name: "first", routing: {} } }).status, "saved")
+  assert.deepEqual(r.parseJsonc(readFileSync(created, "utf8")), { profiles: { first: { "[native]": {} } } })
+  const odd = join(dir, "odd.jsonc")
+  writeFileSync(odd, '{ "profiles": [] }')
+  assert.equal(r.saveConfig({ path: odd, openedText: '{ "profiles": [] }', drafts: [], profile }).status, "error")
+  assert.equal(readFileSync(odd, "utf8"), '{ "profiles": [] }', "a malformed profiles container is never written over")
+})

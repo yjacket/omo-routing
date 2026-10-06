@@ -2,7 +2,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { availabilityOf, decodeKey } from "../extension/routing.ts"
-import { KEY, cells, makeEditor, press, screen, select, strip } from "./editor-fixture.mjs"
+import { KEY, RAW, cells, makeEditor, press, screen, select, strip } from "./editor-fixture.mjs"
 
 const row = (text, label) => text.split("\n").find(line => line.startsWith(`▸ ${label} `) || line.startsWith(`  ${label} `))
 
@@ -258,4 +258,214 @@ test("chains use the approved short provider and effort labels; model names and 
   })
   select(editor, "x", 200)
   assert.match(screen(editor, 200), /claude\/claude-opus-5:H → codex\/gpt-6-astra:X → nvidia\/nemo:L → devin\/swe-2-high/)
+})
+
+const profileRoutingExpected = {
+  model_profile: "capable",
+  categories: {
+    deep: { models: ["anthropic-subscription/claude-opus:high"], disable: true },
+    implementer: { description: "Writes production code.", models: ["anthropic-subscription/claude-opus:high"] },
+    quick: { models: ["devin/swe-2-high"], disable: true },
+  },
+}
+
+test("p opens the profile menu: save-new first, then the existing profiles; Esc goes back to the list", () => {
+  const { editor } = makeEditor({ profile: "work" })
+  press(editor, "p")
+  const text = screen(editor)
+  assert.match(text, /^프로필$/m)
+  assert.match(text, /^▸ \+ 새 프로필 저장$/m)
+  for (const name of ["work · 편집 중", "legacy", "both"]) assert.match(text, new RegExp(`^  ${name}$`, "m"), name)
+  press(editor, KEY.down)
+  assert.match(screen(editor), /^▸ work · 편집 중$/m)
+  press(editor, KEY.enter)
+  assert.match(screen(editor), /이 환경에서는 프로필을 고를 수 없습니다/, "no selectProfile seam: nothing is applied")
+  const chosen = []
+  const wired = makeEditor({ selectProfile: name => { chosen.push(name) } })
+  press(wired.editor, "p", KEY.down, KEY.down, KEY.enter)
+  assert.deepEqual(chosen, [], "Enter in the menu only opens the confirmation")
+  assert.match(screen(wired.editor), /^프로필 "legacy" 적용$/m)
+  press(wired.editor, KEY.enter)
+  assert.deepEqual(chosen, ["legacy"])
+  assert.deepEqual(wired.closed, [{ saved: 0, apply: { name: "legacy", drafts: [] } }])
+  press(editor, KEY.esc)
+  assert.match(screen(editor), /▸ main \(capable\)/)
+  assert.deepEqual(editor.pending(), [])
+})
+
+test("the profile menu tells the edited profile from the active one; the apply confirmation names the target and defaults to apply only while nothing is staged", () => {
+  const chosen = []
+  const { editor, closed } = makeEditor({ profile: "work", active: "legacy", selectProfile: name => { chosen.push(name) } })
+  press(editor, "p")
+  const menu = screen(editor)
+  assert.match(menu, /^  work · 편집 중$/m)
+  assert.match(menu, /^  legacy · 활성$/m)
+  press(editor, KEY.down, KEY.down, KEY.down)
+  press(editor, KEY.enter)
+  const text = screen(editor)
+  assert.match(text, /^프로필 "both" 적용$/m)
+  assert.match(text, /^  취소$/m)
+  assert.match(text, /^▸ 적용$/m, "nothing staged: apply is the default row")
+  assert.match(text, /현재: legacy → both/)
+  assert.match(text, /대화 · 작업 폴더 · 메인 모델 유지/)
+  assert.deepEqual([chosen, closed], [[], []], "showing the confirmation does not apply the profile")
+  press(editor, KEY.up, KEY.enter)
+  assert.match(screen(editor), /프로필 both 적용을 취소했습니다/)
+  assert.match(screen(editor), /^▸ both$/m, "cancel returns to the menu on the same profile")
+  assert.deepEqual([chosen, closed], [[], []], "cancel neither asked the host nor closed")
+})
+
+test("with staged edits the confirmation names the count, defaults to cancel, and discarding is an explicit second choice", () => {
+  const chosen = []
+  const { editor, closed } = makeEditor({ profile: "work", active: "work", selectProfile: name => { chosen.push(name) } })
+  select(editor, "deep")
+  press(editor, "x")
+  const staged = structuredClone(editor.pending())
+  press(editor, "p", KEY.down, KEY.down, KEY.enter)
+  let text = screen(editor)
+  assert.match(text, /^프로필 "legacy" 적용$/m)
+  assert.match(text, /^▸ 취소 \(편집 유지\)$/m, "pending edits: cancel is the default row")
+  assert.match(text, /^  저장 안 된 변경 1건 버리고 적용$/m)
+  assert.deepEqual(editor.pending(), staged, "showing the discard choice keeps the edits")
+  press(editor, KEY.enter)
+  assert.deepEqual([chosen, closed, editor.pending()], [[], [], staged], "Enter on the default keeps everything")
+  press(editor, KEY.enter, KEY.down, KEY.enter)
+  assert.deepEqual(chosen, ["legacy"])
+  assert.deepEqual(closed, [{ saved: 0, apply: { name: "legacy", drafts: staged, layer: "work" } }],
+    "the staged edits ride along, so a refused apply can give them back")
+})
+
+test("a refusal from the host seam keeps the overlay open with the reason; a resumed editor gets its edits, layer and counters back", () => {
+  const refuse = makeEditor({ profile: "work", selectProfile: () => "프로필이 사라졌습니다" })
+  select(refuse.editor, "deep")
+  press(refuse.editor, "x", "p", KEY.down, KEY.enter, KEY.down, KEY.enter)
+  assert.match(screen(refuse.editor), /프로필 work: 프로필이 사라졌습니다/)
+  assert.deepEqual(refuse.closed, [])
+  assert.equal(refuse.editor.pending().length, 1)
+
+  const staged = structuredClone(refuse.editor.pending())
+  const { editor, closed } = makeEditor({
+    profile: "work",
+    resume: { drafts: staged, layer: undefined, saved: 2, profiles: ["a"], message: "프로필 x 적용 안 됨: 거부" },
+  })
+  assert.match(screen(editor), /프로필 x 적용 안 됨: 거부/)
+  assert.match(screen(editor), /편집 레이어: base/, "the layer the user was editing comes back")
+  assert.deepEqual(editor.pending(), staged)
+  press(editor, "q")
+  assert.match(screen(editor), /저장 안 된 변경 1건: q\/Esc를 한 번 더/)
+  press(editor, "q")
+  assert.deepEqual(closed, [{ saved: 2, profiles: ["a"] }])
+})
+
+test("a saved profile is reported as saved only, never as applied by closing; the apply screen fits every width", () => {
+  const { editor, closed } = makeEditor({
+    profile: "work",
+    saveProfile: (name, routing) => ({ status: "saved", count: 0, text: JSON.stringify({ ...RAW, profiles: { ...RAW.profiles, [name]: { "[native]": routing } } }) }),
+  })
+  press(editor, "p", KEY.enter, ..."copy", KEY.enter)
+  assert.match(screen(editor), /프로필 "copy" 저장 완료 · 원본 유지 · Enter 적용/)
+  press(editor, KEY.esc, KEY.esc)
+  const status = screen(editor).replace(/\s+/g, " ")
+  assert.match(status, /프로필 copy 저장됨/)
+  assert.deepEqual(closed, [{ saved: 0, profiles: ["copy"] }], "closing reports a saved copy, not an apply request")
+  assert.doesNotMatch(status, /닫으면 적용됩니다/)
+
+  const theme = { fg: (color, text) => `\x1b[3${color.length % 8}m${text}\x1b[0m`, bold: text => `\x1b[1m${text}\x1b[22m` }
+  for (const styled of [undefined, theme]) {
+    for (const width of [19, 24, 40, 80, 140]) {
+      const dirty = makeEditor({ profile: "work", active: "work", theme: styled, rows: () => 24, selectProfile: () => undefined })
+      select(dirty.editor, "deep", 140)
+      press(dirty.editor, "x", "p", KEY.down, KEY.enter)
+      for (const line of dirty.editor.render(width)) assert.equal(cells(line), width, `width ${width}: ${JSON.stringify(strip(line))}`)
+    }
+  }
+})
+
+test("name entry: pasted Korean text and Backspace edit the visible input, Esc cancels, Enter saves the preview and keeps the drafts", () => {
+  const calls = []
+  const { editor, closed } = makeEditor({
+    profile: "work",
+    saveProfile: (name, routing, confirm) => {
+      calls.push({ name, routing: structuredClone(routing), confirm })
+      return { status: "saved", count: 0, text: JSON.stringify({ ...RAW, profiles: { ...RAW.profiles, [name]: { "[native]": routing } } }) }
+    },
+  })
+  select(editor, "deep")
+  press(editor, "x")
+  const staged = structuredClone(editor.pending())
+  press(editor, "p", KEY.enter)
+  assert.match(screen(editor), /^프로필 이름: ▏$/m)
+  editor.handleInput("작업복사")
+  press(editor, KEY.backspace)
+  editor.handleInput("\x1b[200~사본\x1b[201~")
+  assert.match(screen(editor), /^프로필 이름: 작업복사본▏$/m)
+  press(editor, KEY.esc)
+  assert.match(screen(editor), /^▸ \+ 새 프로필 저장$/m, "Esc leaves the entry without saving")
+  assert.equal(calls.length, 0)
+  press(editor, KEY.enter)
+  assert.match(screen(editor), /^프로필 이름: ▏$/m, "reopened empty")
+  press(editor, KEY.enter)
+  assert.match(screen(editor), /프로필 이름을 입력하세요/)
+  editor.handleInput(" work ")
+  press(editor, KEY.enter)
+  assert.match(screen(editor), /프로필 "work"이 이미 있습니다/, "duplicate, after trimming")
+  editor.handleInput("a/b")
+  press(editor, KEY.enter)
+  assert.match(screen(editor), /\/, 제어 문자|공백, 제어 문자/)
+  assert.equal(calls.length, 0, "a refused name never reaches the writer")
+  for (let i = 0; i < 20; i++) press(editor, KEY.backspace)
+  editor.handleInput("  작업복사본 ")
+  press(editor, KEY.enter)
+  assert.deepEqual(calls, [{ name: "작업복사본", routing: profileRoutingExpected, confirm: false }])
+  assert.match(screen(editor), /프로필 "작업복사본" 저장 완료/)
+  assert.match(screen(editor), /^▸ 작업복사본$/m, "the new profile is listed and selected")
+  assert.deepEqual(editor.pending(), staged, "the staged drafts are still pending")
+  press(editor, KEY.esc, "q")
+  assert.match(screen(editor), /저장 안 된 변경 1건: q\/Esc를 한 번 더/)
+  press(editor, "q")
+  assert.deepEqual(closed, [{ saved: 0, profiles: ["작업복사본"] }], "a snapshot is not a saved draft")
+})
+
+test("name entry: an external change needs a second Enter, any other key cancels it, errors keep the entry", () => {
+  const seen = []
+  let phase = "external"
+  const { editor } = makeEditor({
+    saveProfile: (name, _routing, confirm) => {
+      seen.push(confirm)
+      if (phase === "external" && !confirm) return { status: "external-change" }
+      return phase === "clash" ? { status: "error", message: "refusing to write: 프로필 \"copy2\"가 다른 곳에서 만들어졌습니다" }
+        : { status: "saved", count: 0, text: JSON.stringify({ ...RAW, profiles: { ...RAW.profiles, [name]: { "[native]": {} } } }) }
+    },
+  })
+  press(editor, "p", KEY.enter, ..."copy", KEY.enter)
+  assert.match(screen(editor), /편집기를 연 뒤 바뀌었습니다. Enter를 한 번 더/)
+  press(editor, "x", KEY.enter)
+  assert.deepEqual(seen, [false, false], "typing cancelled the confirmation")
+  press(editor, KEY.backspace, KEY.enter)
+  press(editor, KEY.enter)
+  assert.deepEqual(seen, [false, false, false, true])
+  phase = "clash"
+  press(editor, "\x1b[H", KEY.enter, ..."copy2", KEY.enter)
+  assert.match(screen(editor), /^프로필 이름: copy2▏$/m, "a refused write keeps the entry open")
+  assert.match(screen(editor), /프로필 "copy2"가 다른 곳에서 만들어졌습니다/)
+})
+
+test("the profile menu and name entry fit every viewport width, styled or not", () => {
+  const theme = { fg: (color, text) => `\x1b[3${color.length % 8}m${text}\x1b[0m`, bold: text => `\x1b[1m${text}\x1b[22m` }
+  for (const styled of [undefined, theme]) {
+    for (const width of [19, 24, 40, 80, 140]) {
+      const { editor } = makeEditor({ profile: "work", theme: styled, rows: () => 24 })
+      const views = []
+      press(editor, "p")
+      views.push(editor.render(width))
+      press(editor, KEY.enter)
+      editor.handleInput("매우긴프로필이름".repeat(8))
+      views.push(editor.render(width))
+      for (const lines of views) {
+        assert.ok(lines.length <= 19, `height ${lines.length}`)
+        for (const line of lines) assert.equal(cells(line), width, `width ${width}: ${JSON.stringify(strip(line))}`)
+      }
+      assert.equal(views[0].length, views[1].length, "the overlay keeps its height between the menu and the entry")
+    }
+  }
 })
