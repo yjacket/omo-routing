@@ -15,14 +15,6 @@ const temp = t => {
 }
 const node = (nodes, key) => nodes.find(n => n.key === key)
 
-test("renamed subscription providers keep the approved short labels; unknown providers stay verbatim", () => {
-  const lines = r.buildReport({
-    config: { categories: { x: { models: ["anthropic-subscription/claude-opus-5:high", "chatgpt-subscription/gpt-6-astra:max", "nvidia/nemo:low"] } } },
-    profiles: [], builtin: { status: "unavailable", reason: "fixture" },
-  })
-  assert.ok(lines.some(line => line.includes("claude/claude-opus-5:H → codex/gpt-6-astra:X → nvidia/nemo:L")), lines.join("\n"))
-})
-
 test("splitSpec keeps model names that end like efforts and splits provider groups", () => {
   assert.deepEqual(r.splitSpec("devin/swe-2-high"), { providers: ["devin"], model: "swe-2-high" })
   assert.deepEqual(r.splitSpec("{a|b}/m:high"), { providers: ["a", "b"], model: "m", effort: "high" })
@@ -61,6 +53,22 @@ test("effortLevels: the host function wins, else the model metadata decides", as
   assert.equal(await r.hostThinkingLevels({}), undefined)
 })
 
+test("hostThinkingLevels: a bun global install hoists pi-ai beside omo-ai; senpi's own copy wins", async t => {
+  const modules = join(temp(t), "node_modules")
+  const piAi = (dir, level) => {
+    const pkg = join(dir, "@earendil-works", "pi-ai")
+    mkdirSync(join(pkg, "dist"), { recursive: true })
+    writeFileSync(join(pkg, "package.json"), '{"type":"module"}')
+    writeFileSync(join(pkg, "dist", "models.js"), `export const getSupportedThinkingLevels = () => [${JSON.stringify(level)}]\n`)
+  }
+  mkdirSync(join(modules, "omo-ai", "bin"), { recursive: true })
+  const env = { OMO_BIN: join(modules, "omo-ai", "bin", "omo.js") }
+  piAi(modules, "hoisted")
+  assert.deepEqual((await r.hostThinkingLevels(env))?.(), ["hoisted"])
+  piAi(join(modules, "@code-yeongyu", "senpi", "node_modules"), "senpi")
+  assert.deepEqual((await r.hostThinkingLevels(env))?.(), ["senpi"])
+})
+
 test("editorNodes: main, builtin and user-only nodes with each layer's own override", () => {
   const nodes = r.editorNodes({ raw: RAW, profile: "work", builtin: BUILTIN })
   assert.deepEqual(nodes.map(n => n.key), [
@@ -93,6 +101,19 @@ test("workingChain: the layer's own chain as is, else the inherited chain withou
   assert.deepEqual(r.workingChain(quick, undefined, av, true), ["chatgpt-subscription/gpt-mini:low", "openrouter/gpt-mini:low", "anthropic-subscription/claude-haiku:off"])
   assert.deepEqual(r.workingChain(node(nodes, "categories:deep"), "work", av, false), ["anthropic-subscription/claude-opus:high"])
   assert.deepEqual(r.workingChain(node(nodes, "categories:quick"), "work", av, false), ["devin/swe-2-high"])
+})
+
+test("workingChain: an agent that follows its categories starts from the configured category chains, as the list row shows", () => {
+  const av = r.availabilityOf(REGISTRY)
+  const reviewer = node(r.editorNodes({ raw: RAW, profile: "work", builtin: BUILTIN }), "agents:reviewer")
+  assert.equal(reviewer.effective.source, "categories")
+  assert.deepEqual(r.workingChain(reviewer, "work", av, true), ["anthropic-subscription/claude-opus:high"])
+  assert.deepEqual(r.workingChain(reviewer, undefined, av, true), ["anthropic-subscription/claude-opus:high"])
+  assert.deepEqual(r.workingChain(reviewer, undefined, av, false), reviewer.effective.display)
+  // Nothing configured: the categories' builtin chains, hidden rungs only on request.
+  const plain = node(r.editorNodes({ raw: {}, builtin: BUILTIN }), "agents:reviewer")
+  assert.deepEqual(r.workingChain(plain, undefined, av, true), ["chatgpt-subscription/gpt-big:high", "kimi/k3"])
+  assert.deepEqual(r.workingChain(plain, undefined, av, false), ["chatgpt-subscription/gpt-big:high"])
 })
 
 test("chainWarnings: adjacent same-model rungs, unknown ids and no connected candidate", () => {
@@ -166,6 +187,17 @@ test("save engine: removing entries or keys never takes a neighbour's comment wi
   })
   assert.doesNotMatch(text, /^\s*$\n^\s*$/m, "no blank lines are left behind")
   assert.equal(r.removeJsoncPath(`{ "a": 1, "b": 2, "c": 3 }`, ["b"]), `{ "a": 1, "c": 3 }`, "inline objects stay tidy")
+})
+
+test("save engine: agents chains write efforts as { model, variant } objects, categories keep strings", () => {
+  const chain = ["chatgpt-subscription/gpt-mini:low", "devin/swe-2-high", "chatgpt-subscription/gpt-mini:low"]
+  const drafts = [{ section: "agents", name: "librarian", disable: null, chain }, draft("quick", { chain })]
+  const text = r.applyDrafts(SRC, drafts)
+  const raw = r.parseJsonc(text)
+  assert.deepEqual(raw["[native]"].agents.librarian, { models: [{ model: "chatgpt-subscription/gpt-mini", variant: "low" }, "devin/swe-2-high"] })
+  assert.deepEqual(raw["[native]"].categories.quick, { models: ["chatgpt-subscription/gpt-mini:low", "devin/swe-2-high"] })
+  assert.deepEqual(r.applyDraftsToConfig(r.parseJsonc(SRC), drafts), raw, "the in-memory preview equals the written file")
+  assert.deepEqual(r.chainOf(raw["[native]"].agents.librarian), ["chatgpt-subscription/gpt-mini:low", "devin/swe-2-high"], "the editor reads it back unchanged")
 })
 
 test("the in-memory preview never writes through __proto__", () => {
@@ -253,7 +285,6 @@ test("builtin snapshot: drift reports new, changed and removed nodes; unreadable
   assert.deepEqual(drift.sections.categories.deep, { kind: "changed", before: ["chatgpt-subscription/gpt-old"], after: ["chatgpt-subscription/gpt-big:high", "kimi/k3"] })
   assert.equal(drift.sections.categories.writing.kind, "new")
   assert.equal(drift.sections.categories.legacy.kind, "removed")
-  assert.equal(r.driftLine(drift), "builtin changes since last review (reviewed on OMO 1.0): new 1 (writing), changed 1 (deep), removed 1 (legacy); /routing edit to review")
 
   const unreadable = { ...BUILTIN, defaults: { ...BUILTIN.defaults, categories: {}, unavailable: { categories: "fixture" } } }
   const partial = r.builtinSnapshot(unreadable, "3.0")
@@ -284,7 +315,7 @@ test("projectConfigs: routing-setting project files from cwd up to, not includin
   write(join(proj, "sub"), "{ broken")
   const found = r.projectConfigs(join(proj, "sub", "deeper"), home)
   assert.deepEqual(found.map(f => [f.dir, f.problem === undefined]), [[join(proj, "sub"), false], [proj, true]])
-  assert.match(r.projectNotice(found[1]), /also sets routing/)
-  assert.match(r.projectNotice(found[0], true), /읽지 못했습니다/)
+  assert.match(r.projectNotice(found[1]), /도 라우팅을 정합니다/)
+  assert.match(r.projectNotice(found[0]), /읽지 못했습니다/)
   assert.ok(!existsSync(join(home, "work", "proj", "sub", "deeper")))
 })

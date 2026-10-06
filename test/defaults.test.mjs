@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as routing from "../extension/routing.ts"
@@ -25,25 +25,14 @@ function fixture(t, config) {
   const configPath = join(home, ".omo", "omo.jsonc")
   if (config !== undefined) writeFileSync(configPath, JSON.stringify(config))
   const env = { OMO_BIN: join(root, "bin", "omo.js") }
-  let command
-  const reports = []
-  const ctx = { ui: { notify: (message, kind) => reports.push({ message, kind }) }, modelRegistry: { getAvailable() { throw new Error("provider checks are out of scope") } } }
-  routing.createRouting({ registerCommand: (_name, value) => { command = value } }, { home, env })
-  return { home, env, extensions, configPath, reports, run: (args = "") => command.handler(args, ctx) }
+  return { home, env, extensions, configPath }
 }
 
-// Parse the 라우팅 column of a table row, not prose: assertions below concern
-// candidate models and precedence, never the surrounding layout.
-function row(report, name) {
-  const line = report.split("\n").find(line => line.startsWith(name + "  "))
-  return line?.trim().split(/\s{2,}/)[2]?.replace(/\s+\[[^\]]*\]$/, "")
-}
-
-test("installed defaults are read without executing the host when user config is absent", async t => {
+test("installed defaults are read without executing the host when user config is absent", t => {
   const h = fixture(t)
-  await h.run()
-  assert.equal(row(h.reports.at(-1).message, "quick"), "{one|two}/fast:L")
-  assert.equal(row(h.reports.at(-1).message, "explore"), "four/search")
+  const { display } = routing.resolveRouting({}, routing.loadBuiltinRouting(h.env))
+  assert.deepEqual(display.categories.quick, ["{one|two}/fast:low"])
+  assert.deepEqual(display.agents.explore, ["four/search"])
 })
 
 test("an unrecognizable bundle leaves only its own sections unavailable, and never claims defaults it could not read", t => {
@@ -61,18 +50,7 @@ test("an unrecognizable bundle leaves only its own sections unavailable, and nev
   assert.equal(none.defaults, undefined)
 })
 
-test("a table that cannot be read marks only its own rows 확인 불가 and names the section", async t => {
-  const h = fixture(t, { model_profile: "capable", categories: { quick: { models: ["custom/model"] } } })
-  writeFileSync(join(h.extensions, "omo-task.js"), TASK_SOURCE.replace('model:"fast"', "model:fast()"))
-  await h.run()
-  const report = h.reports.at(-1).message
-  assert.match(report, /^warning: builtin category chains unavailable; those rows show configured chains only \(.*non-constant/m)
-  assert.match(report, /^quick\s.*확인 불가$/m)
-  assert.equal(row(report, "explore"), "four/search")
-  assert.match(report, /^main \(capable\)\s.*기본$/m)
-})
-
-test("tables are recognised by shape, so a renamed category (deep -> deep-low/deep-high) keeps builtin defaults loading", async t => {
+test("tables are recognised by shape, so a renamed category (deep -> deep-low/deep-high) keeps builtin defaults loading", t => {
   const h = fixture(t)
   // The 2026-09 OMO bundle: no `deep` category at all, agents listed before categories, definitions after both.
   writeFileSync(join(h.extensions, "omo-task.js"), `var a={explore:[{providers:["four"],model:"search"}],librarian:[{providers:["five"],model:"docs"}]};var c={"deep-low":[{providers:["three"],model:"smart",variant:"medium"}],"deep-high":[{providers:["three","nine"],model:"smart",variant:"high"}],quick:[{providers:["one"],model:"fast"}]};var d=[{name:"deep-high",config:{model:"three/smart",variant:"high"},description:"Escalation lane."}];throw new Error("must never execute installed source");`)
@@ -80,10 +58,7 @@ test("tables are recognised by shape, so a renamed category (deep -> deep-low/de
   assert.equal(result.status, "loaded", result.reason)
   assert.deepEqual(Object.keys(result.defaults.categories).sort(), ["deep-high", "deep-low", "quick"])
   assert.deepEqual(Object.keys(result.defaults.agents).sort(), ["explore", "librarian"])
-  await h.run()
-  const report = h.reports.at(-1).message
-  assert.equal(row(report, "deep-high"), "three/smart:H → {three|nine}/smart:H")
-  assert.match(report, /^deep-high\s.*기본$/m)
+  assert.deepEqual(routing.resolveRouting({}, result).display.categories["deep-high"], ["three/smart:high", "{three|nine}/smart:high"])
 })
 
 test("main profiles are read by shape: extra leading fields and spread provider lists (2026-09-24 bundle)", t => {
@@ -184,22 +159,15 @@ test("agents inheriting builtin categories reflect effective category overrides"
   assert.deepEqual(effective.config.agents.reviewer.models, ["custom/reason", "one/fast:low", "two/fast:low"])
 })
 
-test("profile overlays replace builtin chains without changing untouched defaults", async t => {
-  const h = fixture(t, {
+test("profile overlays replace builtin chains without changing untouched defaults", t => {
+  const h = fixture(t)
+  const raw = {
     categories: { quick: { models: ["base/model"] } },
     profiles: { work: { "[senpi]": { categories: { quick: { models: ["profile/model"] } } } } },
-  })
-  await h.run("work")
-  assert.equal(row(h.reports.at(-1).message, "quick"), "profile/model")
-  assert.equal(row(h.reports.at(-1).message, "deep"), "three/smart:H")
-})
-
-test("add materializes an inherited default chain in the written profile only", async t => {
-  const h = fixture(t, { profiles: { work: { "[senpi]": {} } } })
-  await h.run("add --profile work quick custom/extra")
-  const written = JSON.parse(readFileSync(h.configPath, "utf8"))
-  assert.deepEqual(written.profiles.work["[senpi]"].categories.quick.models, ["one/fast:low", "two/fast:low", "custom/extra"])
-  assert.equal(written.categories, undefined)
+  }
+  const { display } = routing.resolveRouting(routing.applyProfile(raw, "work").config, routing.loadBuiltinRouting(h.env))
+  assert.deepEqual(display.categories.quick, ["profile/model"])
+  assert.deepEqual(display.categories.deep, ["three/smart:high"])
 })
 
 test("builtin category primary precedes the fallback table, including fallback_models-only overrides", t => {

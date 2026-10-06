@@ -244,3 +244,18 @@ test("^H is Backspace except under Windows Terminal, which sends it for ctrl+Bac
   assert.equal(decodeKey("\b", undefined, {}), "backspace")
   assert.equal(decodeKey("\b", undefined, { WT_SESSION: "1" }), undefined)
 })
+
+test("chains use the approved short provider and effort labels; model names and unknown providers stay verbatim", () => {
+  const models = [
+    { provider: "anthropic-subscription", id: "claude-opus-5", name: "Claude Opus 5", reasoning: true },
+    { provider: "chatgpt-subscription", id: "gpt-6-astra", name: "GPT-6 Astra", reasoning: true },
+    { provider: "nvidia", id: "nemo", name: "Nemo", reasoning: true },
+    { provider: "devin", id: "swe-2-high", name: "SWE-2 high", reasoning: false },
+  ]
+  const { editor } = makeEditor({
+    raw: { "[native]": { categories: { x: { models: ["anthropic-subscription/claude-opus-5:high", "chatgpt-subscription/gpt-6-astra:max", "nvidia/nemo:low", "devin/swe-2-high"] } } } },
+    availability: availabilityOf({ getAvailable: () => models }),
+  })
+  select(editor, "x", 200)
+  assert.match(screen(editor, 200), /claude\/claude-opus-5:H → codex\/gpt-6-astra:X → nvidia\/nemo:L → devin\/swe-2-high/)
+})

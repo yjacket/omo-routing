@@ -1,39 +1,22 @@
-// routing: print effective model routing from installed OMO defaults and ~/.omo/omo.jsonc — the
-// per-category and per-agent chains — for the current profile, or for a
-// profile named on the command line.
+// routing: `/routing` opens an interactive editor (omo TUI only) for the model
+// chains of ~/.omo/omo.jsonc: every routing node of the installed OMO with its
+// builtin chain, the base/profile overrides on top, rungs of providers this
+// session is not connected to hidden, and builtin changes since the last
+// review flagged. Edits are staged and saved together.
 //
-//   /routing            current profile (OMO_PROFILE > OCX_PROFILE > OPENCODE_CONFIG_DIR tail; else base)
-//   /routing <profile>  `profiles.<name>` applied on top of the base config
-//   /routing base       base config only, no profile overlay
-//   /routing off        hide the widget (a bare /routing also toggles it off)
-//
-//   /routing help       usage for every form
-//   /routing models [--profile <name>|--base]   enabled categories grouped by the
-//                       model they would try at each candidate position (1차, 2차, …)
-//   /routing set    <name> <model...>   replace the chain (full fallback order)
-//   /routing set    <name> <n> <model...>   replace rung n (1-based) only
-//   /routing prepend <name> <model...>  insert rungs at the front
-//   /routing add    <name> <model...>   append rungs
-//   /routing remove <name> <model...>   drop rungs
-//     With `set <n>` and `prepend`, a model that already sits elsewhere in the
-//     chain moves to the new position; `add` skips rungs already present.
-//     <name>:   main | main:<model_profile> | <category> | <agent> | category:<n> | agent:<n>
-//     <model>:  provider/model[:variant]
-//     --profile <name> / --base pick the layer written; default is the current
-//     profile's `[native]` section (base when no profile is set).
-//   /routing edit [--profile <name>|--base]   interactive editor (omo TUI only):
-//                       every routing node of the installed OMO with its builtin chain,
-//                       the base/profile overrides on top, rungs of providers this
-//                       session is not connected to hidden, builtin changes since the
-//                       last review flagged; edits are staged and saved together.
+//   /routing                the current profile's layer (OMO_PROFILE > OCX_PROFILE >
+//                           OPENCODE_CONFIG_DIR tail) with base one Tab away; base alone when none is set
+//   /routing -p <name>      that profile's layer (also --profile <name>)
+//   /routing --base         base alone, no profile overlay
+//   `/routing edit ...` is the same command under its former name.
 //
 // Resolution mirrors omo-task.js: layers merge base -> [native] -> profile base
 // -> profile [native], where a layer without `[native]` uses its legacy
-// `[senpi]` section instead; objects deep-merge, arrays replace. Edits are applied to
-// the omo.jsonc text at byte offsets, so comments and formatting survive; a
-// copy of the previous file is kept as omo.jsonc.bak. The reports check nothing
-// against live provider state; only the editor reads the session's connected
-// models (ctx.modelRegistry.getAvailable()) to hide and offer candidates.
+// `[senpi]` section instead; objects deep-merge, arrays replace. Saves are
+// applied to the omo.jsonc text at byte offsets, so comments and formatting
+// survive; the file from before the session's first save is kept as
+// omo.jsonc.bak. Only the session's connected models
+// (ctx.modelRegistry.getAvailable()) are read, to hide and offer candidates.
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, lstatSync, mkdirSync } from "node:fs"
 import { join, dirname, resolve } from "node:path"
@@ -506,7 +489,7 @@ export function resolveRouting(config: Record<string, unknown>, builtin: Builtin
       sources[section][name] = source
       display[section][name] ??= chain
       // Materialized model lists are for editing only; provider alternatives stay
-      // grouped in the report. Never merge these defaults into the raw file.
+      // grouped for display. Never merge these defaults into the raw file.
       effective[section][name] = { ...entry, model: undefined, models: chain }
     }
   }
@@ -575,7 +558,7 @@ function formatChain(chain: readonly string[]): string {
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
-/** Cell width for the report's plain text (not ANSI-styled terminal output).
+/** Cell width of plain text (not ANSI-styled terminal output).
  * Ambiguous-width characters, including →, use the usual one-cell setting.
  */
 function graphemeWidth(text: string): number {
@@ -640,104 +623,10 @@ function wrapText(text: string, width: number, indent: string): string[] {
   return out
 }
 
-/** Wrap every report line. Table rows arrive already laid out for this width;
- * free-form header, warning and legend lines keep their hanging indent. */
-export function fitLines(lines: string[], width: number): string[] {
-  if (!(width > 0)) return lines
-  return lines.flatMap(line => {
-    const m = line.match(/^(\S+(?: \(\S+\))?\s{2,})(.*)$/)
-    const column = m ? displayWidth(m[1]) : 2
-    return wrapText(line, width, " ".repeat(column <= width / 2 ? column : width >= 4 ? 2 : 0))
-  })
-}
-
-// ---------------------------------------------------------------------------
-// The approved report table: 카테고리명 | 설명 | 라우팅 | 변경여부, and the
-// models table: 모델 | 프로바이더 | 담당 카테고리.
-
-const TABLE_HEAD = ["카테고리명", "설명", "라우팅", "변경여부"] as const
-const MODELS_HEAD = ["모델", "프로바이더", "담당 카테고리"] as const
-const MODELS_MIN = [12, 8, 12] as const
-const COLUMN_GAP = 2
-const MIN_DESCRIPTION = 12
-const MIN_ROUTING = 16
-const MAX_NAME = 24
-const DESCRIPTION_SHARE = 0.4
 const EMPTY_CELL = "-"
 
-type TableCell = string[]
-type TableEntry = { label: string } | { cells: TableCell[] }
-
-const padCell = (text: string, width: number): string => text + " ".repeat(Math.max(0, width - displayWidth(text)))
-
-/** Column widths for this viewport, or `[]` when the columns no longer fit and
- * each cell has to be stacked under its row name instead. */
-function columnWidths(rows: TableCell[][], width: number): number[] {
-  const natural = naturalWidths(rows, TABLE_HEAD.length)
-  const gaps = COLUMN_GAP * (TABLE_HEAD.length - 1)
-  if (!(width > 0) || natural.reduce((sum, cells) => sum + cells, 0) + gaps <= width) return natural
-  const name = Math.min(natural[0], MAX_NAME)
-  const available = width - gaps - name - natural[3]
-  if (available < MIN_DESCRIPTION + MIN_ROUTING) return []
-  // A chain is wrapped at its arrows and stays readable; a description column
-  // squeezed to a proportional sliver is not. Give the text its share first.
-  let description = Math.min(natural[1], Math.max(MIN_DESCRIPTION, Math.floor(available * DESCRIPTION_SHARE)))
-  let routing = available - description
-  if (routing > natural[2]) { routing = natural[2]; description = Math.min(natural[1], available - routing) }
-  if (routing < MIN_ROUTING) { routing = MIN_ROUTING; description = available - routing }
-  return [name, description, routing, natural[3]]
-}
-
-const naturalWidths = (rows: TableCell[][], columns: number): number[] =>
-  Array.from({ length: columns }, (_, column) => Math.max(0, ...rows.map(row => Math.max(0, ...row[column].map(displayWidth)))))
-
-/** Shrink the widest column one cell at a time until the row fits, never below
- * its minimum; `[]` when not even the minimums fit and cells must be stacked. */
-function shrinkWidths(rows: TableCell[][], width: number, mins: readonly number[]): number[] {
-  const widths = naturalWidths(rows, mins.length)
-  const gaps = COLUMN_GAP * (mins.length - 1)
-  const total = () => widths.reduce((sum, cells) => sum + cells, 0) + gaps
-  if (!(width > 0)) return widths
-  while (total() > width) {
-    let widest = -1
-    for (let column = 0; column < widths.length; column++)
-      if (widths[column] > mins[column] && (widest < 0 || widths[column] > widths[widest])) widest = column
-    if (widest < 0) return []
-    widths[widest]--
-  }
-  return widths
-}
-
-type TableSpec = { head: readonly string[]; widths(rows: TableCell[][], width: number): number[] }
-const REPORT_TABLE: TableSpec = { head: TABLE_HEAD, widths: columnWidths }
-const MODELS_TABLE: TableSpec = { head: MODELS_HEAD, widths: (rows, width) => shrinkWidths(rows, width, MODELS_MIN) }
-
-/** Render header, section labels and rows; cells wrap inside their own column. */
-function renderTable(entries: TableEntry[], width: number, spec: TableSpec = REPORT_TABLE): string[] {
-  const rows = entries.flatMap(entry => ("cells" in entry ? [entry.cells] : []))
-  if (!rows.length) return []
-  const widths = spec.widths(rows, width)
-  const stacked = widths.length === 0
-  const indent = stacked && width >= 4 ? "  " : ""
-  return entries.flatMap(entry => {
-    if ("label" in entry) return entry.label ? wrapText(entry.label, width, indent) : [""]
-    if (stacked) {
-      const [name, ...rest] = entry.cells
-      return [
-        ...name.flatMap(line => wrapText(line, width, indent)),
-        ...rest.flat().filter(Boolean).flatMap(line =>
-          wrapText(line, Math.max(1, width - indent.length), "").map(part => indent + part)),
-      ]
-    }
-    const wrapped = entry.cells.map((cell, column) => cell.flatMap(line => wrapText(line, widths[column], "")))
-    const height = Math.max(...wrapped.map(lines => lines.length))
-    return Array.from({ length: height }, (_, line) =>
-      wrapped.map((lines, column) => padCell(lines[line] ?? "", widths[column])).join(" ".repeat(COLUMN_GAP)).trimEnd())
-  })
-}
-
-/** 설명 cell: the configured or builtin role text, shortened to its first
- * sentence so the column stays a column. Never a guess about routing. */
+/** A node's configured or builtin role text, shortened to its first sentence
+ * so the description column stays a column. Never a guess about routing. */
 export function summarize(value: unknown, limit = 60): string {
   if (typeof value !== "string") return ""
   const clean = value.replace(/\s+/gu, " ").trim()
@@ -755,183 +644,8 @@ export function summarize(value: unknown, limit = 60): string {
   return text === clean ? text : `${text.replace(/[.,;:]$/u, "")}…`
 }
 
-/** pi-tui component factory: bypasses the host's fixed line cap for string-array
- * widgets. A function source is re-laid-out for every viewport width. */
-export function widgetFactory(source: string[] | ((width: number) => string[])) {
-  return (_tui: unknown, _theme: unknown) => ({
-    render: (width: number) => fitLines(typeof source === "function" ? source(width) : source, width),
-    invalidate() {},
-  })
-}
-
-type Resolved = ReturnType<typeof resolveRouting>
-
-/** Effective routing of one entry: the ordered canonical candidates it would
- * actually try, plus whether it is switched off. Display labels never take part. */
-function routingKey(resolved: Resolved, section: "categories" | "agents", name: string): string | undefined {
-  const source = resolved.sources[section][name]
-  if (source === undefined) return undefined
-  if (source === "disabled") return "disabled"
-  const models: string[] = (resolved.config as any)[section]?.[name]?.models ?? []
-  return JSON.stringify([...new Set([...models, ...(resolved.fallbackModels[section][name] ?? [])])])
-}
-
-export type ReportInput = {
-  config: any
-  profile?: string
-  profiles: string[]
-  warning?: string
-  builtin?: BuiltinRouting
-  configPath?: string
-  /** Extra warnings, e.g. project configs that also set routing. */
-  notices?: string[]
-  /** Builtin changes since the last review in `/routing edit`; shown when nonempty. */
-  drift?: Drift
-}
-
-const suppliedBuiltin = (input: ReportInput): BuiltinRouting =>
-  input.builtin ?? { status: "unavailable", reason: "installed OMO source was not supplied" }
-
-/** The header every view shares: applied overlay, main selection, sources and warnings. */
-function metadataLines(input: ReportInput, builtin: BuiltinRouting, resolved: Resolved): string[] {
-  const { profile, profiles, warning, configPath } = input
-  const lines = [
-    `config profile: ${profile ?? "base (no overlay)"}   available profiles: ${profiles.length ? profiles.join(", ") : "none defined"}`,
-    `main model chain (model_profile): ${resolved.mainSelection ?? "not selected; host/session model is unchanged"}`,
-    `user config: ${configPath ?? "absent (~/.omo/omo.jsonc or omo.json)"}`,
-    builtin.status === "loaded"
-      ? `builtin defaults: ${configPath ? "loaded; used where routing falls back" : "in use"} (${builtin.source})`
-      : `warning: builtin defaults unavailable; showing configured chains only (${builtin.reason})`,
-  ]
-  if (builtin.status === "loaded")
-    for (const [section, reason] of Object.entries(builtin.defaults.unavailable))
-      lines.push(`warning: builtin ${SECTION_LABELS[section as BuiltinSection]} unavailable; those rows show configured chains only (${reason})`)
-  if (warning) lines.push(`warning: ${warning}`)
-  for (const notice of input.notices ?? []) lines.push(`warning: ${notice}`)
-  if (input.drift?.count) lines.push(driftLine(input.drift))
-  return lines
-}
-
 const SECTION_LABELS: Record<BuiltinSection, string> = {
   categories: "category chains", agents: "agent chains", model_profiles: "main model profiles",
-}
-
-export function buildReport(input: ReportInput, width = 0): string[] {
-  const { config } = input
-  const builtin = suppliedBuiltin(input)
-  const resolved = resolveRouting(config, builtin)
-  // The same resolution with no user config at all: the routing OMO would use.
-  const baseline = builtin.status === "loaded" ? resolveRouting({}, builtin) : undefined
-  const builtinDescriptions = builtin.status === "loaded" ? builtin.defaults.descriptions : undefined
-  const lines = metadataLines(input, builtin, resolved)
-
-  // A section whose builtin table could not be read cannot be compared. Agents
-  // also inherit category routing, so they depend on the category table too.
-  const unreadable = (section: BuiltinSection): boolean => builtin.status !== "loaded"
-    || section in builtin.defaults.unavailable || (section === "agents" && "categories" in builtin.defaults.unavailable)
-  // 변경여부 answers "does this route differently from OMO's builtin routing?",
-  // not "is there a user config?": an override that reproduces the default is 기본.
-  const status = (section: "categories" | "agents", name: string): string => {
-    if (!baseline || unreadable(section)) return "확인 불가"
-    const base = routingKey(baseline, section, name)
-    return base !== undefined && base === routingKey(resolved, section, name) ? "기본" : "변경"
-  }
-  const describe = (configured: any, builtinText: string | undefined): string =>
-    summarize(configured?.description ?? configured?.display_name ?? builtinText) || EMPTY_CELL
-  const rowFor = (section: "categories" | "agents", name: string): TableCell[] => {
-    const source = resolved.sources[section][name]
-    const routing = source === "disabled" ? ["(disabled)"] : [`${formatChain(resolved.display[section][name])} [${source}]`]
-    const fallback = resolved.fallbacks[section][name]
-    if (source !== "disabled" && fallback?.length) routing.push(`builtin fallback: ${formatChain(fallback)}`)
-    return [[name], [describe((resolved.config as any)[section]?.[name], builtinDescriptions?.[section][name])], routing, [status(section, name)]]
-  }
-
-  const entries: TableEntry[] = []
-  const selection = resolved.mainSelection
-  if (selection) {
-    const pinned = selection.includes("/")
-    const source = pinned ? "configured pin" : resolved.sources.model_profiles[selection] ?? "unresolved"
-    const profileEntry = pinned ? undefined : (resolved.config as any).model_profiles?.[selection]
-    const base: string[] | undefined = (baseline?.config as any)?.model_profiles?.[selection]?.models
-    const mainStatus = !baseline || (!pinned && unreadable("model_profiles")) ? "확인 불가"
-      : !pinned && base && JSON.stringify(base) === JSON.stringify(profileEntry?.models ?? []) ? "기본" : "변경"
-    entries.push({ label: "main:" }, { cells: [
-      [`main (${selection})`],
-      [describe(profileEntry, builtinDescriptions?.model_profiles[selection])],
-      [`${formatChain(resolved.mainChain)} [${source}]`],
-      [mainStatus],
-    ] })
-  }
-  for (const section of ["categories", "agents"] as const) {
-    const names = Object.keys(resolved.display[section]).sort()
-    if (!names.length) continue
-    if (entries.length) entries.push({ label: "" })
-    entries.push({ label: `${section}:` }, ...names.map(name => ({ cells: rowFor(section, name) })))
-  }
-  if (entries.length) {
-    lines.push("", ...renderTable([{ cells: TABLE_HEAD.map(head => [head]) }, ...entries], width))
-    lines.push("", "변경여부: 기본 = same routing as the OMO builtin default, 변경 = differs, 확인 불가 = builtin routing could not be read.")
-    if (builtin.status === "loaded") lines.push("{provider|provider} = alternatives within one builtin rung; availability/auth not checked.")
-  }
-  return lines
-}
-
-// ---------------------------------------------------------------------------
-// The models view: which model each enabled category would try at 1차, 2차, …
-
-type ModelGroup = { id: string; providers: string[]; categories: string[] }
-
-/**
- * Enabled categories grouped by canonical model ID + effort at every candidate
- * position. One builtin `{a|b}` rung is a single position whose providers are
- * alternatives; successive configured entries stay separate positions. The key
- * is the canonical ID, so `:off` and `:none` never merge and display labels
- * take no part in the grouping.
- */
-export function modelPositions(resolved: Resolved): ModelGroup[][] {
-  const positions: Map<string, ModelGroup>[] = []
-  for (const name of Object.keys(resolved.display.categories).sort()) {
-    if (resolved.sources.categories[name] === "disabled") continue
-    resolved.display.categories[name].forEach((spec, index) => {
-      const rung = splitRung(spec)
-      const id = rung?.id ?? spec
-      positions[index] ??= new Map()
-      const groups = positions[index]
-      const group = groups.get(id) ?? { id, providers: [], categories: [] }
-      for (const provider of rung?.providers ?? []) if (!group.providers.includes(provider)) group.providers.push(provider)
-      if (!group.categories.includes(name)) group.categories.push(name)
-      groups.set(id, group)
-    })
-  }
-  return positions.map(groups => [...(groups?.values() ?? [])])
-}
-
-/** Same resolution and metadata as the report, read by model instead of by
- * category. Categories only: agents and the main chain are out of scope here. */
-export function buildModelsReport(input: ReportInput, width = 0): string[] {
-  const builtin = suppliedBuiltin(input)
-  const resolved = resolveRouting(input.config, builtin)
-  const lines = metadataLines(input, builtin, resolved)
-  const entries: TableEntry[] = []
-  modelPositions(resolved).forEach((groups, index) => {
-    if (entries.length) entries.push({ label: "" })
-    entries.push({ label: `${index + 1}차:` }, ...groups.map(group => ({
-      cells: [
-        [labelModel(group.id)],
-        [group.providers.map(labelProvider).join(", ") || EMPTY_CELL],
-        [group.categories.join(", ")],
-      ],
-    })))
-  })
-  if (!entries.length) {
-    lines.push("", "(no enabled categories to group)")
-    return lines
-  }
-  lines.push("", ...renderTable([{ cells: MODELS_HEAD.map(head => [head]) }, ...entries], width, MODELS_TABLE))
-  lines.push("",
-    "1차/2차/… = 후보 순서의 위치. 한 행의 여러 프로바이더는 같은 위치의 대안이며, 별개의 폴백 단계가 아닙니다.",
-    "Enabled categories only (no agents, no main chain); these are pre-availability candidates, auth is not checked.")
-  return lines
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,48 +854,8 @@ export function removeJsoncPath(src: string, path: string[]): string {
   return comma >= 0 ? out.slice(0, comma) + out.slice(comma + 1) : out
 }
 
-// ---------------------------------------------------------------------------
-// /routing set|add|remove
-
-const EDIT_VERBS = new Set(["set", "prepend", "add", "remove"])
-
-/** `/routing help` text; also the pointer given on a malformed edit. */
-export const HELP_LINES = [
-  "/routing                      current profile's chains (again or `off` hides)",
-  "/routing <profile> | base     a named profile's chains | base config only",
-  "/routing help                 this text",
-  "",
-  "/routing models [--profile <p>|-p <p>|--base]   enabled categories grouped by the model",
-  "                              they would try at each candidate position (1차, 2차, …); shows only, never writes",
-  "",
-  "/routing set    <name> <model...>   replace the chain with these rungs, in fallback order",
-  "/routing set    <name> <n> <model...>   replace rung n only (1 = first; a model already in the chain moves there)",
-  "/routing prepend <name> <model...>  insert rungs at the front (an existing rung moves to the front)",
-  "/routing add    <name> <model...>   append rungs",
-  "/routing remove <name> <model...>   drop rungs",
-  "",
-  "  <name>   main | main:<model_profile> | <category> | <agent> | category:<n> | agent:<n>",
-  "  <model>  provider/model[:variant], e.g. openai-codex/gpt-5.6-sol:high",
-  "  --profile <p> | --base   layer to write (default: current profile, else base)",
-  "",
-  "/routing edit [--profile <p>|-p <p>|--base]   interactive editor in the omo TUI: builtin chains of the",
-  "                              installed OMO under your base/profile changes; unconnected providers hidden;",
-  "                              builtin changes since the last review flagged; keys are listed in its footer",
-  "",
-  "변경여부: 기본 = same routing as the OMO builtin default, 변경 = differs (chain, disable or inherited category),",
-  "           확인 불가 = the installed builtin routing could not be read.",
-  "Display only: codex=chatgpt-subscription|openai-codex, claude=anthropic-subscription|claude-sdk-oauth,",
-  "              gh=github-copilot; other providers unchanged.",
-  "Effort labels: X=max, E=xhigh, H=high, M=medium, L=low, O=off or none, mi=minimal, au=auto.",
-  "Use canonical IDs for edits, not display labels; model names and unknown values stay unchanged.",
-  "Edits touch only that `models` array in ~/.omo/omo.jsonc; the previous file is kept as omo.jsonc.bak.",
-]
-
-export type EditArgs = { verb: "set" | "prepend" | "add" | "remove"; target: string; models: string[]; profile?: string; base: boolean; at?: number }
-
-/** `/routing models [--profile <name>|-p <name>|--base]`: the layer to read.
- * Anything else is an error, since this view takes no other argument. */
-export function parseModelsArgs(words: readonly string[], form = "models"): { profile?: string; base: boolean } | string {
+/** `/routing [--profile <name>|-p <name>|--base]`: the layer to open. */
+export function parseEditorArgs(words: readonly string[]): { profile?: string; base: boolean } | string {
   let profile: string | undefined
   let base = false
   for (let i = 0; i < words.length; i++) {
@@ -1189,86 +863,14 @@ export function parseModelsArgs(words: readonly string[], form = "models"): { pr
     if (word === "--base") base = true
     else if (word === "--profile" || word === "-p") {
       profile = words[++i]
-      if (!profile) return `/routing ${form} --profile needs a name (see /routing help)`
-    } else return `"${word}" is not an option for /routing ${form}; use --profile <name> or --base (see /routing help)`
+      if (!profile) return "--profile needs a profile name"
+    } else return `"${word}" is not an option; use /routing [--profile <name>|-p <name>|--base]`
   }
   return { profile, base }
 }
 
-/** Parse `set|prepend|add|remove [--profile <name>|--base] <target> [<n>] <model...>`; returns an error string on bad input.
- * `<n>` (1-based rung position) is accepted for `set` only. */
-export function parseEditArgs(args: string): EditArgs | string {
-  const words = args.trim().split(/\s+/).filter(Boolean)
-  const verb = words.shift() as EditArgs["verb"]
-  let profile: string | undefined
-  let base = false
-  const rest: string[] = []
-  for (let i = 0; i < words.length; i++) {
-    if (words[i] === "--base") base = true
-    else if (words[i] === "--profile" || words[i] === "-p") {
-      profile = words[++i]
-      if (!profile) return "--profile needs a name"
-    } else rest.push(words[i])
-  }
-  const [target, ...models] = rest
-  if (!target) return `usage: /routing ${verb} [--profile <name>|--base] <name> ${verb === "set" ? "[<n>] " : ""}<provider/model[:variant]...> (see /routing help)`
-  let at: number | undefined
-  if (/^\d+$/.test(models[0] ?? "")) {
-    if (verb !== "set") return `a rung position is only accepted by set (/routing set <name> <n> <model...>; see /routing help)`
-    at = Number(models.shift())
-    if (at < 1) return `rung position must be 1 or more (1 = first rung)`
-  }
-  if (!models.length) return `no models given for "${target}" (provider/model[:variant], space separated; see /routing help)`
-  const bad = models.find((m) => !/^[^\s/:]+\/[^\s/]+$/.test(m))
-  if (bad) return `"${bad}" is not provider/model[:variant] (see /routing help)`
-  return at === undefined ? { verb, target, models, profile, base } : { verb, target, models, profile, base, at }
-}
-
-/**
- * Where a target lives in the effective config: `main` / `main:<mp>` ->
- * model_profiles; `category:x` / `agent:x` explicit; a bare name must be
- * exactly one of a known category or agent.
- */
-export function resolveTarget(target: string, config: any): { path: string[]; label: string } | string {
-  const categories = isObj(config?.categories) ? Object.keys(config.categories) : []
-  const agents = isObj(config?.agents) ? Object.keys(config.agents) : []
-  if (target === "main" || target.startsWith("main:")) {
-    const mp = target === "main" ? config?.model_profile : target.slice(5)
-    if (!mp) return "no model_profile is set; use main:<name>"
-    return { path: ["model_profiles", mp], label: `main (${mp})` }
-  }
-  const m = target.match(/^(category|agent):(.+)$/)
-  if (m) return { path: [m[1] === "agent" ? "agents" : "categories", m[2]], label: `${m[1]} ${m[2]}` }
-  const isCat = categories.includes(target)
-  const isAgent = agents.includes(target)
-  if (isCat && isAgent) return `"${target}" is both a category and an agent; use category:${target} or agent:${target}`
-  if (isCat) return { path: ["categories", target], label: `category ${target}` }
-  if (isAgent) return { path: ["agents", target], label: `agent ${target}` }
-  return `unknown target "${target}"; use category:<name> or agent:<name> to create it (known categories: ${categories.join(", ") || "none"}; agents: ${agents.join(", ") || "none"})`
-}
-
-/** New chain after applying the verb to the current chain, or an error string.
- * `at` (1-based, `set` only) replaces that one rung. With `set <n>` and
- * `prepend` a model already elsewhere in the chain moves to the new position;
- * `add` keeps existing rungs where they are. A chain never repeats a rung. */
-export function applyChainEdit(verb: EditArgs["verb"], current: string[], models: string[], at?: number): string[] | string {
-  if (verb === "set" && at !== undefined) {
-    if (at > current.length) return `rung ${at} does not exist; the chain has ${current.length} rung${current.length === 1 ? "" : "s"}`
-    const out: string[] = []
-    current.forEach((m, i) => {
-      if (i === at - 1) out.push(...models)
-      else if (!models.includes(m)) out.push(m)
-    })
-    return [...new Set(out)]
-  }
-  if (verb === "set") return [...new Set(models)]
-  if (verb === "prepend") return [...new Set([...models, ...current])]
-  if (verb === "add") return [...new Set([...current, ...models])]
-  return current.filter((m) => !models.includes(m))
-}
-
 // ---------------------------------------------------------------------------
-// /routing edit: the interactive editor. The component and everything it uses
+// /routing: the interactive editor. The component and everything it uses
 // are exported and free of host imports, so the fake harness drives them.
 
 export type Section = "categories" | "agents" | "model_profiles"
@@ -1378,8 +980,10 @@ export function effortLevels(model: ModelInfo | undefined, host?: ThinkingLevels
  * imported from its file (package exports are not assumed). */
 export async function hostThinkingLevels(env: Record<string, string | undefined>): Promise<ThinkingLevelsOf | undefined> {
   if (!env.OMO_BIN) return undefined
-  const modules = join(dirname(env.OMO_BIN), "..", "node_modules")
-  const file = [join(modules, "@code-yeongyu", "senpi", "node_modules"), modules]
+  const root = join(dirname(env.OMO_BIN), "..")
+  // npm nests omo-ai's dependencies under it; a bun global install hoists them beside it.
+  const file = [join(root, "node_modules"), dirname(root)]
+    .flatMap(modules => [join(modules, "@code-yeongyu", "senpi", "node_modules"), modules])
     .map(dir => join(dir, "@earendil-works", "pi-ai", "dist", "models.js")).find(path => existsSync(path))
   if (!file) return undefined
   try {
@@ -1405,8 +1009,8 @@ const pathValue = (value: any, path: readonly string[]): any =>
 const samePath = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((key, i) => key === b[i])
 
 /** Where a node lives in one layer: the locations defining it now (layer root,
- * harness section) and the one a write targets, chosen like `/routing set`:
- * the harness section, else the root when it already holds routing keys, else
+ * harness section) and the one a write targets: the harness section, else
+ * the root when it already holds routing keys, else
  * a new `[native]`. */
 function entryLocations(raw: any, layer: LayerRef, section: Section, name: string) {
   const prefix = layer.profile === undefined ? [] : ["profiles", layer.profile]
@@ -1461,7 +1065,14 @@ function draftOps(raw: any, draft: EditorDraft): { ops: EditOp[]; prune: string[
   const { target, existing, reset } = entryLocations(raw, { profile: draft.profile }, draft.section, draft.name)
   const ops: EditOp[] = []
   if (reset && ((Array.isArray(draft.chain) && draft.chain.length) || draft.disable !== null)) ops.push({ set: reset, value: {} })
-  const chain = Array.isArray(draft.chain) ? [...new Set(draft.chain)] : draft.chain
+  const specs = Array.isArray(draft.chain) ? [...new Set(draft.chain)] : draft.chain
+  // OMO's agent resolver does not parse a ":effort" suffix in string rungs: write { model, variant }.
+  const chain = specs && draft.section === "agents" ? specs.map(spec => {
+    const parsed = splitSpec(spec)
+    if (!parsed?.effort) return spec
+    const slash = spec.indexOf("/")
+    return { model: `${spec.slice(0, slash)}/${parsed.model}`, variant: parsed.effort }
+  }) : specs
   if (chain !== undefined) {
     for (const path of existing) {
       ops.push({ remove: [...path, "model"] }, { remove: [...path, "fallback_models"] })
@@ -1625,7 +1236,9 @@ export function workingChain(node: EditorNode, profile: string | undefined, avai
   // A category with only fallback_models runs builtin primary + those + builtin rungs.
   const merged = node.effective.source === "configured + builtin"
   if (own?.chain?.length && !merged) return [...own.chain]
-  const inherited = merged ? node.effective.models
+  // An agent with no chain of its own runs the configured chains of its categories.
+  const viaCategories = node.effective.source === "categories" && !(profile !== undefined && node.base?.chain?.length)
+  const inherited = merged || viaCategories ? node.effective.models
     : profile !== undefined && node.base?.chain?.length ? node.base.chain : node.builtin?.models ?? []
   return showHidden ? [...inherited] : inherited.filter(spec => rungView(spec, availability).visible)
 }
@@ -1747,15 +1360,6 @@ const driftNames = (drift: Drift, kind: DriftEntry["kind"]): string[] =>
   SECTIONS.flatMap(section => Object.entries(drift.sections[section] ?? {})
     .filter(([, entry]) => entry.kind === kind).map(([name]) => driftName(section, name)))
 
-/** The report's one-line summary of builtin changes since the last review. */
-export function driftLine(drift: Drift): string {
-  const parts = (["new", "changed", "removed"] as const).flatMap(kind => {
-    const names = driftNames(drift, kind)
-    return names.length ? [`${kind} ${names.length} (${names.join(", ")})`] : []
-  })
-  return `builtin changes since last review${drift.since ? ` (reviewed on OMO ${drift.since})` : ""}: ${parts.join(", ")}; /routing edit to review`
-}
-
 export type ProjectConfig = { path: string; dir: string; problem?: string }
 
 const hasRouting = (config: any): boolean => isObj(config) && (
@@ -1803,11 +1407,9 @@ export function projectConfigs(cwd: string, home: string): ProjectConfig[] {
   return found
 }
 
-export const projectNotice = (config: ProjectConfig, korean = false): string => config.problem === undefined
-  ? korean ? `프로젝트 설정 ${config.path}도 라우팅을 정합니다: ${config.dir} 아래에서 시작한 세션에서는 이 설정이 ~/.omo/omo.jsonc 위에 덮입니다`
-    : `project config ${config.path} also sets routing; OMO merges it over ~/.omo/omo.jsonc in sessions started under ${config.dir}`
-  : korean ? `프로젝트 설정 ${config.path}을 읽지 못했습니다 (${config.problem}): 라우팅을 정한다면 OMO가 적용합니다`
-    : `project config ${config.path} could not be read (${config.problem}); if it sets routing, OMO applies it`
+export const projectNotice = (config: ProjectConfig): string => config.problem === undefined
+  ? `프로젝트 설정 ${config.path}도 라우팅을 정합니다: ${config.dir} 아래에서 시작한 세션에서는 이 설정이 ~/.omo/omo.jsonc 위에 덮입니다`
+  : `프로젝트 설정 ${config.path}을 읽지 못했습니다 (${config.problem}): 라우팅을 정한다면 OMO가 적용합니다`
 
 const RAW_KEYS: Record<string, string> = {
   "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
@@ -1896,7 +1498,7 @@ export const EDITOR_OVERLAY = { width: "96%", maxHeight: "80%", minWidth: 40, ma
 /** Descriptions are prompt prose; markdown emphasis only clutters a cell. */
 const plainText = (text: string): string => text.replace(/\*\*|__|`/g, "")
 /** Why a reload waits while the editor is open (the host shows it as "Hot-reload deferred: …"). */
-export const EDITOR_RELOAD_VETO = "/routing edit is open; the reload runs when it closes"
+export const EDITOR_RELOAD_VETO = "the /routing editor is open; the reload runs when it closes"
 const EDITOR_HEIGHT = 0.8
 const draftKey = (profile: string | undefined, section: Section, name: string): string => `${profile ?? ""}\u0000${section}\u0000${name}`
 
@@ -2639,8 +2241,9 @@ export class RoutingEditor {
     if (drift?.kind === "changed" && drift.before) add(`이전 빌트인${this.drift?.since ? ` (OMO ${this.drift.since})` : ""}: ${formatChain(drift.before)}`, "dim")
     if (drift?.kind === "new") add("이번 OMO에서 새로 생긴 노드입니다", "warning")
     if (drift?.kind === "removed") add("OMO 빌트인에서 빠졌습니다: 지금은 내 설정만 남아 있습니다", "warning")
-    add(`base: ${this.overrideText(node.base, "빌트인을 따름")}`)
-    if (profile !== undefined) add(`profile ${profile}: ${this.overrideText(node.profile, node.base?.chain ? "base를 따름" : "빌트인을 따름")}`)
+    const inherits = node.effective.source === "categories" ? "카테고리를 따름" : "빌트인을 따름"
+    add(`base: ${this.overrideText(node.base, inherits)}`)
+    if (profile !== undefined) add(`profile ${profile}: ${this.overrideText(node.profile, node.base?.chain ? "base를 따름" : inherits)}`)
     add(`적용: ${node.effective.source === "disabled" ? "(비활성)" : `${this.chainText(node.effective.display, true)}  [${node.effective.source}]`}`)
     if (drift?.kind === "changed" && (node.base?.chain || node.profile?.chain))
       add("⚠ 빌트인이 바뀌었지만 내 체인이 그 위를 덮고 있습니다: r로 기본값을 따르면 업데이트가 반영됩니다", "warning")
@@ -2660,23 +2263,12 @@ export function createRouting(pi: any, deps: Deps = {}) {
   const env = deps.env ?? process.env
   const home = deps.home ?? (userInfo().homedir || homedir())
 
-  let shown = false
   // OMO hot-reloads omo.jsonc when it changes, and a reload tears down an open
-  // /routing edit with its unsaved edits; the editor holds reloads off until it
+  // editor with its unsaved edits; the editor holds reloads off until it
   // closes (the host defers and retries, then applies the saved file).
   let editing = false
-  // The host keeps extension widgets across /reload while this closure is
-  // recreated, so the old instance clears its widget before reload and the new
-  // one clears any leftover on start; otherwise the first /routing after a
-  // reload would redraw instead of hiding.
-  const hide = (ctx: any) => { if (typeof ctx?.ui?.setWidget === "function") ctx.ui.setWidget("routing", undefined); shown = false }
-  if (typeof pi.on === "function") {
-    pi.on("session_before_reload", async (_e: unknown, ctx: any) => {
-      if (editing) return { cancel: true, reason: EDITOR_RELOAD_VETO }
-      hide(ctx)
-    })
-    pi.on("session_start", async (_e: unknown, ctx: any) => { hide(ctx) })
-  }
+  if (typeof pi.on === "function")
+    pi.on("session_before_reload", async () => editing ? { cancel: true, reason: EDITOR_RELOAD_VETO } : undefined)
 
   const omoDir = join(home, ".omo")
   const findConfig = () => ["omo.jsonc", "omo.json"].map((f) => join(omoDir, f)).find((p) => existsSync(p))
@@ -2686,61 +2278,14 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const cwd = projectCwd(ctx)
     return cwd ? projectConfigs(cwd, home) : []
   }
-  /** Read-only: the reports compare with the last reviewed snapshot but never write it. */
-  const reviewDrift = (builtin: BuiltinRouting): Drift | undefined => {
-    const reviewed = readSnapshot(snapshotPath(home))
-    if (!reviewed || builtin.status !== "loaded") return undefined
-    const drift = snapshotDrift(reviewed, builtinSnapshot(builtin, omoVersion(env)))
-    return drift.count ? drift : undefined
-  }
-  // The last report shown, redrawn after the editor saves.
-  let lastView: { wanted: string | undefined; build: (input: ReportInput, width: number) => string[] } | undefined
 
-  const show = (
-    ctx: any, raw: any, wanted: string | undefined, extra: string[] = [],
-    build: (input: ReportInput, width: number) => string[] = buildReport,
-  ) => {
-    const profiles = profileNames(raw)
-    const { config, profile, warning } = applyProfile(raw, wanted)
-    // Read the installed source once; the table itself is laid out per viewport.
-    const builtin = loadBuiltinRouting(env)
-    const report: ReportInput = {
-      config, profile, profiles, warning, builtin, configPath: findConfig(),
-      notices: projectFound(ctx).map(found => projectNotice(found)), drift: reviewDrift(builtin),
-    }
-    lastView = { wanted, build }
-    const lines = (width: number) => [...extra, ...build(report, width)]
-    // Widget hosts get the table above the editor and nothing else;
-    // hosts without a widget get the whole report in the toast.
-    if (typeof ctx?.ui?.setWidget === "function") {
-      ctx.ui.setWidget("routing", widgetFactory(width => [...lines(width), "", "(/routing again or /routing off to hide)"]), { placement: "aboveEditor" })
-      shown = true
-    } else {
-      ctx.ui.notify(lines(0).join("\n"), "info")
-    }
-  }
-
-  /** Read-only view of another layer: it never switches the profile and never writes. */
-  const models = (words: string[], ctx: any) => {
-    const parsed = parseModelsArgs(words)
-    if (typeof parsed === "string") { ctx.ui.notify(`routing: ${parsed}`, "error"); return }
-    const cfgPath = findConfig()
-    const raw = cfgPath ? parseJsonc(readFileSync(cfgPath, "utf8")) : {}
-    const profiles = profileNames(raw)
-    if (parsed.profile && !profiles.includes(parsed.profile)) {
-      ctx.ui.notify(`routing: no profile "${parsed.profile}" in omo.jsonc (available profiles: ${profiles.length ? profiles.join(", ") : "none"})`, "error")
-      return
-    }
-    show(ctx, raw, parsed.base ? undefined : parsed.profile ?? resolveProfileName(env), [], buildModelsReport)
-  }
-
-  /** `/routing edit`: the interactive overlay. Opens on the current (or named)
-   * profile's layer with base one Tab away, or on base alone with --base. */
+  /** The interactive overlay. Opens on the current (or named) profile's layer
+   * with base one Tab away, or on base alone with --base. */
   const editor = async (words: string[], ctx: any) => {
-    const parsed = parseModelsArgs(words, "edit")
+    const parsed = parseEditorArgs(words)
     if (typeof parsed === "string") { ctx.ui.notify(`routing: ${parsed}`, "error"); return }
     if (typeof ctx?.ui?.custom !== "function" || (ctx.mode !== undefined && ctx.mode !== "tui")) {
-      ctx.ui.notify("routing: /routing edit needs the interactive omo TUI; here use /routing set|prepend|add|remove (see /routing help)", "error")
+      ctx.ui.notify("routing: the /routing editor needs the interactive omo TUI", "error")
       return
     }
     const cfgPath = findConfig() ?? join(omoDir, "omo.jsonc")
@@ -2770,7 +2315,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     if (builtin.status !== "loaded") warnings.push(`OMO 빌트인 기본값을 읽지 못해 설정된 체인만 보입니다 (${builtin.reason})`)
     else for (const [section, reason] of Object.entries(builtin.defaults.unavailable))
       warnings.push(`빌트인 ${SECTION_LABELS[section as BuiltinSection]}을 읽지 못해 그 노드는 설정된 체인만 보입니다 (${reason})`)
-    for (const found of projectFound(ctx)) warnings.push(projectNotice(found, true))
+    for (const found of projectFound(ctx)) warnings.push(projectNotice(found))
     const omo = omoVersion(env)
     const snapshotFile = snapshotPath(home)
     const current = builtinSnapshot(builtin, omo)
@@ -2829,76 +2374,15 @@ export function createRouting(pi: any, deps: Deps = {}) {
     if (!saved) return
     const backup = backupPath ? ` (previous version: ${backupPath})` : ""
     ctx.ui.notify(`routing: saved ${saved} change(s) to ${cfgPath}${backup}; OMO hot-reloads it now that the editor is closed (/reload if hot reload is off)`, "info")
-    if (shown && lastView) {
-      const text = findConfig()
-      show(ctx, text ? parseJsonc(readFileSync(text, "utf8")) : {}, lastView.wanted, [], lastView.build)
-    }
-  }
-
-  const edit = (args: string, ctx: any) => {
-    const parsed = parseEditArgs(args)
-    if (typeof parsed === "string") { ctx.ui.notify(`routing: ${parsed}`, "error"); return }
-    const cfgPath = findConfig()
-    if (!cfgPath) { ctx.ui.notify(`routing: no omo.jsonc in ${omoDir}`, "error"); return }
-    const src = readFileSync(cfgPath, "utf8")
-    const raw = parseJsonc(src)
-    const profiles = profileNames(raw)
-
-    const profile = parsed.base ? undefined : parsed.profile ?? resolveProfileName(env)
-    if (profile && !profiles.includes(profile)) {
-      ctx.ui.notify(`routing: no profile "${profile}" in omo.jsonc (available profiles: ${profiles.length ? profiles.join(", ") : "none"}); use --base to edit the base config`, "error")
-      return
-    }
-    const { config: configured } = applyProfile(raw, profile)
-    const { config } = resolveRouting(configured, loadBuiltinRouting(env))
-    const target = resolveTarget(parsed.target, config)
-    if (typeof target === "string") { ctx.ui.notify(`routing: ${target}`, "error"); return }
-
-    // Layer written: the profile's (or base's) harness section OMO applies —
-    // `[native]`, else a legacy `[senpi]` — or a new `[native]` when the layer
-    // root holds no routing keys; otherwise the layer root.
-    const layerPath = profile ? ["profiles", profile] : []
-    const layer = profile ? raw.profiles[profile] : raw
-    const section = ["[native]", "[senpi]"].find((k) => isObj(layer?.[k]))
-      ?? (["categories", "agents", "model_profiles"].some((k) => isObj(layer?.[k])) ? undefined : "[native]")
-    const entryPath = [...layerPath, ...(section ? [section] : []), ...target.path]
-
-    const chain = applyChainEdit(parsed.verb, chainOf(config?.[target.path[0]]?.[target.path[1]]), parsed.models, parsed.at)
-    if (typeof chain === "string") { ctx.ui.notify(`routing: ${target.label}: ${chain}`, "error"); return }
-    let next = removeJsoncPath(src, [...entryPath, "model"])
-    next = setJsoncPath(next, [...entryPath, "models"], chain)
-    try { parseJsonc(next) } catch (e: any) { ctx.ui.notify(`routing: refusing to write, result is not valid JSON: ${e?.message ?? e}`, "error"); return }
-    copyFileSync(cfgPath, cfgPath + ".bak")
-    writeFileSync(cfgPath, next, "utf8")
-    const where = `${profile ? `profile ${profile}` : "base"}${section ? ` ${section}` : ""}`
-    show(ctx, parseJsonc(next), profile, [`wrote ${target.label} in ${where}: ${formatChain(chain)}`, ""])
   }
 
   pi.registerCommand("routing", {
-    description: "show effective model chains (config + installed OMO defaults), or edit config (`edit` opens an interactive editor); `help` lists the forms",
-    argumentHint: "[profile|base|off|help|models|edit|set|prepend|add|remove ...]",
+    description: "edit the model chains of ~/.omo/omo.jsonc over the installed OMO defaults in an interactive editor",
+    argumentHint: "[--profile <p>|-p <p>|--base]",
     handler: async (args: string, ctx: any) => {
-      const hasWidget = typeof ctx?.ui?.setWidget === "function"
-      const arg = (args ?? "").trim()
-      if (hasWidget && (arg === "off" || (arg === "" && shown))) { hide(ctx); return }
-      if (arg === "help" || arg === "-h" || arg === "--help") {
-        if (hasWidget) { ctx.ui.setWidget("routing", widgetFactory([...HELP_LINES, "", "(/routing again or /routing off to hide)"]), { placement: "aboveEditor" }); shown = true }
-        else ctx.ui.notify(HELP_LINES.join("\n"), "info")
-        return
-      }
-      const words = arg.split(/\s+/).filter(Boolean)
-      if (words[0] === "models") { models(words.slice(1), ctx); return }
-      if (words[0] === "edit") { await editor(words.slice(1), ctx); return }
-      if (EDIT_VERBS.has(words[0])) { edit(arg, ctx); return }
-      const cfgPath = findConfig()
-      const raw = cfgPath ? parseJsonc(readFileSync(cfgPath, "utf8")) : {}
-      const profiles = profileNames(raw)
-      const wanted = arg === "" ? resolveProfileName(env) : arg === "base" ? undefined : arg
-      if (arg && arg !== "base" && !profiles.includes(arg)) {
-        ctx.ui.notify(`routing: no profile "${arg}" in omo.jsonc (available profiles: ${profiles.length ? profiles.join(", ") : "none"})`, "error")
-        return
-      }
-      show(ctx, raw, wanted)
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean)
+      // `edit` is the command's former form and still opens the editor.
+      await editor(words[0] === "edit" ? words.slice(1) : words, ctx)
     },
   })
 }
