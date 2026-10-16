@@ -11,7 +11,7 @@ A single-file Senpi/OMO extension (`extension/routing.ts`) that registers a `/ro
 ```sh
 node --test                                   # all tests (Node >= 22.6; .mjs tests import the .ts via built-in type stripping; run inside omo or set OMO_BIN: fixtures borrow omo-ai's @babel/parser and one test reads the installed bundles)
 node --test --test-name-pattern="profile"     # single test by name substring
-cp extension/routing.ts ~/.omo/agent/extensions/   # install (no script; README has the curl/iwr one-liners), then /reload in omo
+omo install <path-to-this-clone>              # install the working tree as an omo package (users: omo install git:github.com/yjacket/omo-routing), then /reload
 ```
 
 No build step, no lint, no dependencies. Never test against a live paid OMO session; the fake `pi`/`ctx` harnesses (`test/editor-command.test.mjs` with a fake `ui.custom` and model registry, `test/editor-fixture.mjs`) are the only runtime used. A live check of `/routing` sends no prompt: slash commands never reach the model.

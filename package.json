@@ -4,8 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Senpi/OMO extension: /routing prints and edits (set|add|remove) the per-category and per-agent model chains configured in omo.jsonc for the current or a named profile.",
+  "pi": {
+    "extensions": [
+      "extension/routing.ts"
+    ]
+  },
   "scripts": {
     "test": "node --test"
   },
-  "engines": { "node": ">=22.6" }
+  "engines": {
+    "node": ">=22.6"
+  }
 }

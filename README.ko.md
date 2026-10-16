@@ -231,21 +231,15 @@ OMO 업그레이드 후에는 소스 파일과 실행 중인 호스트가 일치
 
 ## 설치
 
-클론할 필요 없이 파일 하나를 OMO 확장 디렉터리로 받으면 됩니다.
-
 ```sh
-# *nix / Git Bash
-mkdir -p ~/.omo/agent/extensions && curl -fsSL https://raw.githubusercontent.com/yjacket/omo-routing/master/extension/routing.ts -o ~/.omo/agent/extensions/routing.ts
-```
-```powershell
-# Windows
-New-Item -Force -ItemType Directory "$HOME\.omo\agent\extensions" | Out-Null; iwr https://raw.githubusercontent.com/yjacket/omo-routing/master/extension/routing.ts -OutFile "$HOME\.omo\agent\extensions\routing.ts"
+omo install git:github.com/yjacket/omo-routing
 ```
 
-클론한 상태라면 `cp extension/routing.ts ~/.omo/agent/extensions/`.
+omo가 저장소를 `~/.omo/agent/git/github.com/yjacket/omo-routing`에 클론하고 `~/.omo/agent/settings.json`의 `packages`에 등록합니다. 실행 중인 세션에서 `/reload`를 입력하세요.
 
-그 뒤 실행 중인 세션에서 `/reload` (또는 재시작) 하고 `/routing` 을
-실행하세요.
+**업데이트:** `omo update --extensions`(설치된 패키지 전부) 또는 `omo update git:github.com/yjacket/omo-routing`를 실행한 뒤 `/reload`를 입력하세요.
+
+예전에 파일 하나로 설치했다면 `~/.omo/agent/extensions/routing.ts`를 지우세요. 남겨 두면 패키지와 함께 로드됩니다. 그다음 `/routing`을 실행하세요.
 
 ## 테스트
 

@@ -241,20 +241,15 @@ upgrading OMO so the source on disk and the running host agree.
 
 ## Install
 
-No clone needed: fetch the single file into the OMO extension dir.
-
 ```sh
-# *nix / Git Bash
-mkdir -p ~/.omo/agent/extensions && curl -fsSL https://raw.githubusercontent.com/yjacket/omo-routing/master/extension/routing.ts -o ~/.omo/agent/extensions/routing.ts
-```
-```powershell
-# Windows
-New-Item -Force -ItemType Directory "$HOME\.omo\agent\extensions" | Out-Null; iwr https://raw.githubusercontent.com/yjacket/omo-routing/master/extension/routing.ts -OutFile "$HOME\.omo\agent\extensions\routing.ts"
+omo install git:github.com/yjacket/omo-routing
 ```
 
-From a clone: `cp extension/routing.ts ~/.omo/agent/extensions/`.
+omo clones the repository into `~/.omo/agent/git/github.com/yjacket/omo-routing` and adds it to `packages` in `~/.omo/agent/settings.json`. Type `/reload` in running sessions.
 
-Then `/reload` in a running session (or restart) and run `/routing`.
+**Update:** `omo update --extensions` (every installed package) or `omo update git:github.com/yjacket/omo-routing`, then `/reload`.
+
+If you installed the single file before, delete `~/.omo/agent/extensions/routing.ts`, or it loads next to the package. Then run `/routing`.
 
 ## Tests
 
