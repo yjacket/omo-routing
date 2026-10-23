@@ -201,3 +201,19 @@ test("source failures retain the cache but cannot enable an expired promotion", 
   h.apply()
   assert.deepEqual(config(h.path), parseJsonc(SRC))
 })
+
+test("an unchanged recomposition rewrites neither the config nor the state file", t => {
+  // Given: an applied promotion whose state file was left in another formatting.
+  const h = fixture(t)
+  h.apply()
+  const disk = readFileSync(h.path, "utf8")
+  const compact = JSON.stringify(JSON.parse(readFileSync(h.policies.statePath, "utf8")))
+  writeFileSync(h.policies.statePath, compact)
+
+  // When: a reloaded session recomposes the same result.
+  h.apply()
+
+  // Then: both files are untouched.
+  assert.equal(readFileSync(h.path, "utf8"), disk)
+  assert.equal(readFileSync(h.policies.statePath, "utf8"), compact)
+})

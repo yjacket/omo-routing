@@ -1,6 +1,7 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
+import { isDeepStrictEqual } from "node:util"
 import { composePolicies, isPolicyReceipt, unwrapPolicies } from "./routing-policy.ts"
 import type { PolicyReceipt, PromoSchedule } from "./routing-policy.ts"
 import { fetchCodexSignal, fetchPromoSchedule, isCodexSignal, signalStatus } from "./routing-signals.ts"
@@ -38,7 +39,22 @@ const digest = (text: string): string => createHash("sha256").update(text).diges
 function atomic(path: string, text: string): void {
   const temp = `${path}.${process.pid}.tmp`
   writeFileSync(temp, text, "utf8")
-  renameSync(temp, path)
+  // Windows refuses to replace a file another process is reading (Bun opens it
+  // without delete sharing), and sessions read these files without the lock.
+  const deadline = Date.now() + 2_000
+  for (;;) {
+    try {
+      renameSync(temp, path)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (!(code === "EPERM" || code === "EACCES" || code === "EBUSY") || Date.now() >= deadline) {
+        rmSync(temp, { force: true })
+        throw error
+      }
+    }
+    Atomics.wait(SLEEP, 0, 0, 25)
+  }
 }
 
 /** The JSONC file holds effective chains; the receipt remembers only policy
@@ -152,6 +168,9 @@ export class RoutingPolicies {
         throw new Error("omo.jsonc or routing policies changed during the save; try again")
       const state = this.state()
       const result = composePolicies(options.base, { promo: state.promoEnabled ? state.promo : null, codex: state.codexPreferred }, options.builtin, this.now())
+      // Every session recomposes on each reload; an unchanged result writes nothing.
+      if (disk === result.text && state.pending === undefined && state.configPath === options.path
+        && isDeepStrictEqual(state.receipt, result.receipt)) return result.text
       if (options.backup && disk !== undefined) copyFileSync(options.path, `${options.path}.bak`)
       this.persist({ ...state, pending: { configPath: options.path, digest: digest(result.text), receipt: result.receipt } })
       if (disk !== result.text) {
