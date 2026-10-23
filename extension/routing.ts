@@ -26,9 +26,18 @@ import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 import { createContext, runInContext } from "node:vm"
 import { isDeepStrictEqual } from "node:util"
+import { RoutingPolicies } from "./routing-runtime.ts"
+import { promoMessage, nudge } from "./routing-signals.ts"
 
 /** `cwd` is where OMO looks for project `.omo/omo.jsonc` files (default: ctx.cwd). */
-export type Deps = { env?: Record<string, string | undefined>; home?: string; cwd?: string }
+export type Deps = { env?: Record<string, string | undefined>; home?: string; cwd?: string; now?: () => number; fetcher?: typeof fetch }
+type PolicyContext = {
+  readonly ui?: {
+    readonly setStatus?: (key: string, value: string | undefined) => void
+    readonly notify?: (message: string, kind: string) => void
+  }
+  readonly sessionManager?: { readonly getBranch?: () => readonly unknown[] }
+}
 
 const SKIP_KEYS = new Set(["__proto__", "constructor", "prototype"])
 const HARNESS_KEYS = new Set(["[opencode]", "[native]", "[senpi]", "[codex]", "[omo]"])
@@ -1205,14 +1214,14 @@ export function applySnapshot(src: string, name: string, routing: Record<string,
 }
 
 export type SaveResult =
-  | { status: "saved"; text: string; count: number; backup?: string }
+  | { status: "saved"; text: string; diskText?: string; count: number; backup?: string }
   | { status: "external-change" }
   | { status: "error"; message: string }
 
 /** Write drafts to the config file. `openedText` (the file as the editor read
  * it) guards against silently overwriting an edit made meanwhile; the result
  * must parse, the previous file is kept as `.bak`, a missing file is created. */
-export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean; backup?: boolean; profile?: { name: string; routing: Record<string, unknown> } }): SaveResult {
+export function saveConfig(options: { path: string; openedText?: string; drafts: readonly EditorDraft[]; confirmExternal?: boolean; backup?: boolean; profile?: { name: string; routing: Record<string, unknown> }; policies?: RoutingPolicies; builtin?: BuiltinRouting }): SaveResult {
   const { path, openedText, drafts } = options
   let current: string | undefined
   try {
@@ -1222,8 +1231,10 @@ export function saveConfig(options: { path: string; openedText?: string; drafts:
   }
   if (current !== openedText && !options.confirmExternal) return { status: "external-change" }
   let next: string
+  let baseBefore: string
   try {
-    next = options.profile ? applySnapshot(current ?? "{\n}\n", options.profile.name, options.profile.routing) : applyDrafts(current ?? "{\n}\n", drafts)
+    baseBefore = current === undefined ? "{\n}\n" : options.policies?.base(current, path) ?? current
+    next = options.profile ? applySnapshot(baseBefore, options.profile.name, options.profile.routing) : applyDrafts(baseBefore, drafts)
     parseJsonc(next)
   } catch (error) {
     return { status: "error", message: `refusing to write ${path}: ${errorText(error)}` }
@@ -1231,14 +1242,19 @@ export function saveConfig(options: { path: string; openedText?: string; drafts:
   // `backup: false` keeps an existing .bak, e.g. the file as it was before an
   // editor session's first save.
   const backup = current !== undefined && options.backup !== false
+  let diskText: string | undefined
   try {
-    if (current === undefined) mkdirSync(dirname(path), { recursive: true })
-    else if (backup) copyFileSync(path, `${path}.bak`)
-    writeFileSync(path, next, "utf8")
+    if (options.policies && options.builtin) {
+      diskText = options.policies.write({ path, base: next, current, baseBefore, builtin: options.builtin, backup })
+    } else {
+      if (current === undefined) mkdirSync(dirname(path), { recursive: true })
+      else if (backup) copyFileSync(path, `${path}.bak`)
+      writeFileSync(path, next, "utf8")
+    }
   } catch (error) {
     return { status: "error", message: `cannot write ${path}: ${errorText(error)}` }
   }
-  return { status: "saved", text: next, count: drafts.length, ...(backup ? { backup: `${path}.bak` } : {}) }
+  return { status: "saved", text: next, ...(diskText === undefined ? {} : { diskText }), count: drafts.length, ...(backup ? { backup: `${path}.bak` } : {}) }
 }
 
 export type EditorNode = {
@@ -1601,6 +1617,9 @@ export type EditorOptions = {
   omo?: string
   drift?: Drift
   warnings?: readonly string[]
+  /** Editing always uses raw base chains; these callbacks are display-only. */
+  policySummary?: string
+  policyConfig?: (raw: unknown) => unknown
   configPath?: string
   levels?: (model: ModelInfo | undefined) => string[]
   save: (drafts: EditorDraft[], confirmExternal: boolean) => SaveResult
@@ -1641,7 +1660,7 @@ export class RoutingEditor {
   private readonly profilesSaved: string[] = []
   private drift: Drift | undefined
   private version = 0
-  private cache: { version: number; nodes: EditorNode[] } | undefined
+  private cache: { version: number; nodes: EditorNode[]; applied?: EditorNode[] } | undefined
 
   constructor(options: EditorOptions, theme?: Painter, keybindings?: KeyMatcher) {
     this.options = options
@@ -1705,8 +1724,14 @@ export class RoutingEditor {
     if (this.cache?.version === this.version) return this.cache.nodes
     const raw = this.drafts.size ? applyDraftsToConfig(this.raw, this.pending()) : this.raw
     const nodes = editorNodes({ raw, profile: this.options.profile, builtin: this.options.builtin })
-    this.cache = { version: this.version, nodes }
+    const applied = this.options.policyConfig
+      ? editorNodes({ raw: this.options.policyConfig(raw), profile: this.options.profile, builtin: this.options.builtin }) : undefined
+    this.cache = { version: this.version, nodes, applied }
     return nodes
+  }
+
+  private appliedNode(node: EditorNode): EditorNode {
+    return this.cache?.applied?.find(candidate => candidate.key === node.key) ?? node
   }
 
   private changed(): void {
@@ -2325,6 +2350,7 @@ export class RoutingEditor {
   private headerItems(width: number): Item[] {
     const { availability, warnings = [] } = this.options
     const items: Item[] = []
+    if (this.options.policySummary) items.push(...this.wrapped(this.options.policySummary, width, "muted"))
     items.push(...this.wrapped(availability.known
       ? `연결된 프로바이더: ${availability.providers.map(labelProvider).join(", ") || "없음"} · 미연결 후보 ${this.showHidden ? "표시 중" : "숨김"} (h)`
       : `구독 정보를 읽지 못해 모든 후보를 표시합니다 (${availability.reason})`, width, availability.known ? "muted" : "warning"))
@@ -2402,7 +2428,8 @@ export class RoutingEditor {
       const selected = index === this.cursor
       if (selected) focus = items.length
       const badges = [this.badge(node), this.dirty(node) ? "*" : "", nodeWarnings(node, this.options.availability).length ? "⚠" : ""].filter(Boolean).join(" ")
-      const summary = node.readOnly ?? (node.effective.source === "disabled" ? "(비활성)" : this.chainText(node.effective.display, true))
+      const applied = this.appliedNode(node)
+      const summary = node.readOnly ?? (applied.effective.source === "disabled" ? "(비활성)" : this.chainText(applied.effective.display, true))
       items.push({
         text: `${selected ? "▸" : " "} ${padCells(node.label, nameWidth)}  ${descriptionWidth ? `${fitCells(plainText(node.description), descriptionWidth)}  ` : ""}${padCells(nodeState(node, this.layer), 6)}  ${padCells(badges, 8)}  ${summary}`,
         color: selected ? "accent" : node.effective.source === "disabled" ? "dim" : undefined, bold: selected,
@@ -2520,14 +2547,15 @@ export class RoutingEditor {
     }
     const drift = this.driftOf(node)
     const { profile, omo, availability } = this.options
+    const inherits = node.effective.source === "categories" ? "카테고리를 따름" : "빌트인을 따름"
+    add(`base: ${this.overrideText(node.base, inherits)}`)
+    if (profile !== undefined) add(`profile ${profile}: ${this.overrideText(node.profile, node.base?.chain ? "base를 따름" : inherits)}`)
+    const applied = this.appliedNode(node)
+    add(`${isDeepStrictEqual(applied.effective.display, node.effective.display) ? "적용" : "정책 적용"}: ${applied.effective.source === "disabled" ? "(비활성)" : `${this.chainText(applied.effective.display, true)}  [${applied.effective.source}]`}`, "accent")
     add(`빌트인${omo ? ` (OMO ${omo})` : ""}: ${node.builtin ? this.chainText(node.builtin.display, true) : node.userOnly ? "없음 (사용자 정의 노드)" : "읽지 못함"}`)
     if (drift?.kind === "changed" && drift.before) add(`이전 빌트인${this.drift?.since ? ` (OMO ${this.drift.since})` : ""}: ${formatChain(drift.before)}`, "dim")
     if (drift?.kind === "new") add("이번 OMO에서 새로 생긴 노드입니다", "warning")
     if (drift?.kind === "removed") add("OMO 빌트인에서 빠졌습니다: 지금은 내 설정만 남아 있습니다", "warning")
-    const inherits = node.effective.source === "categories" ? "카테고리를 따름" : "빌트인을 따름"
-    add(`base: ${this.overrideText(node.base, inherits)}`)
-    if (profile !== undefined) add(`profile ${profile}: ${this.overrideText(node.profile, node.base?.chain ? "base를 따름" : inherits)}`)
-    add(`적용: ${node.effective.source === "disabled" ? "(비활성)" : `${this.chainText(node.effective.display, true)}  [${node.effective.source}]`}`)
     if (drift?.kind === "changed" && (node.base?.chain || node.profile?.chain))
       add("⚠ 빌트인이 바뀌었지만 내 체인이 그 위를 덮고 있습니다: r로 기본값을 따르면 업데이트가 반영됩니다", "warning")
     if (this.layer === undefined && profile !== undefined && node.profile?.chain)
@@ -2554,9 +2582,11 @@ export function createRouting(pi: any, deps: Deps = {}) {
   // reload is the only proof the host reloaded (ctx.reload() resolves void when
   // it refuses because the agent is busy or another extension vetoed).
   let reloading: { reloaded: boolean } | undefined
+  let stopPolicies = (): void => {}
   if (typeof pi.on === "function") {
     pi.on("session_before_reload", async () => editing ? { cancel: true, reason: EDITOR_RELOAD_VETO } : undefined)
     pi.on("session_shutdown", (event: { reason?: string } | undefined) => {
+      stopPolicies()
       if (reloading && event?.reason === "reload") reloading.reloaded = true
     })
   }
@@ -2597,6 +2627,65 @@ export function createRouting(pi: any, deps: Deps = {}) {
 
   const omoDir = join(home, ".omo")
   const findConfig = () => ["omo.jsonc", "omo.json"].map((f) => join(omoDir, f)).find((p) => existsSync(p))
+  const policies = new RoutingPolicies(home, { now: deps.now, fetcher: deps.fetcher })
+  const applyPolicies = (): void => {
+    const path = findConfig()
+    if (!path) return
+    const current = readFileSync(path, "utf8")
+    const base = policies.base(current, path)
+    policies.write({ path, base, current, baseBefore: base, builtin: loadBuiltinRouting(env), backup: false })
+  }
+  if (typeof pi.on === "function") {
+    let generation = 0
+    pi.on("session_start", (_event: unknown, ctx: PolicyContext) => {
+      stopPolicies()
+      const active = ++generation
+      let timer: ReturnType<typeof setInterval> | undefined
+      let refreshing = false
+      const updateStatus = (): void => {
+        try { ctx.ui?.setStatus?.("omo-routing", policies.status()) }
+        catch { /* A replaced extension runner no longer owns this UI. */ }
+      }
+      const refresh = async (): Promise<void> => {
+        if (refreshing || editing) return
+        refreshing = true
+        try {
+          await policies.refresh()
+          if (active !== generation) return
+          // Fetching may have outlived opening the editor. Its staged base
+          // remains untouched until it saves or closes.
+          if (!editing) applyPolicies()
+          updateStatus()
+        } catch (error) {
+          if (active === generation) ctx.ui?.notify?.(`routing: ${errorText(error)}`, "warning")
+        } finally { refreshing = false }
+      }
+      stopPolicies = () => { generation++; if (timer) clearInterval(timer) }
+      updateStatus()
+      timer = setInterval(() => { void refresh() }, 60_000)
+      timer.unref?.()
+      return refresh()
+    })
+    pi.on("before_agent_start", (event: { readonly preview?: boolean; readonly trigger?: string } | undefined, ctx: PolicyContext) => {
+      if (event?.preview === true || (event?.trigger ?? "prompt") !== "prompt") return undefined
+      const path = findConfig()
+      if (!path) return undefined
+      try {
+        const state = policies.state()
+        const disk = readFileSync(path, "utf8")
+        const preview = policies.preview(policies.base(disk, path), loadBuiltinRouting(env))
+        const configured = applyProfile(parseJsonc(disk), resolveProfileName(env)).config
+        const model = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast"
+        const present = [["categories", "quick"], ["agents", "explore"], ["agents", "librarian"]]
+          .some(([section, name]) => chainOf(configured?.[section]?.[name]).some(spec => spec.split(":")[0] === model))
+        const message = promoMessage(preview.promoActive && present, state.promo?.nextAt ?? null, ctx?.sessionManager?.getBranch?.() ?? [], nudge(env))
+        return message && { message }
+      } catch (error) {
+        ctx.ui?.notify?.(`routing: ${errorText(error)}`, "warning")
+        return undefined
+      }
+    }, { previewSafe: true })
+  }
   /** OMO also merges project configs found from the session's cwd upward. */
   const projectCwd = (ctx: any): string | undefined => deps.cwd ?? (typeof ctx?.cwd === "string" ? ctx.cwd : undefined)
   const projectFound = (ctx: any): ProjectConfig[] => {
@@ -2617,7 +2706,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     let openedText = existsSync(cfgPath) ? readFileSync(cfgPath, "utf8") : undefined
     let raw: any
     try {
-      raw = openedText === undefined ? {} : parseJsonc(openedText)
+      raw = openedText === undefined ? {} : parseJsonc(policies.base(openedText, cfgPath))
     } catch (error) {
       ctx.ui.notify(`routing: cannot parse ${cfgPath}: ${errorText(error)}`, "error")
       return
@@ -2668,7 +2757,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
     // in .bak (or there was none); later writes keep that backup.
     const written = (saved: SaveResult): SaveResult => {
       if (saved.status === "saved") {
-        openedText = saved.text
+        openedText = saved.diskText ?? saved.text
         backedUp = true
         backupPath ??= saved.backup
       }
@@ -2692,15 +2781,17 @@ export function createRouting(pi: any, deps: Deps = {}) {
     }
     const open = (resume?: EditorResume) => ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: EditorResult) => void) => new RoutingEditor({
       raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
+      policySummary: policies.summary(),
+      policyConfig: base => parseJsonc(policies.preview(JSON.stringify(base), builtin).text),
       active: resolveProfileName(env), resume, selectProfile: applyRefusal,
       drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
       levels: model => effortLevels(model, levels),
       save: (drafts, confirmExternal) => {
         // .bak keeps the file as it was before this session's first save.
-        return written(saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp }))
+        return written(saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp, policies, builtin }))
       },
       saveProfile: (name, routing, confirmExternal) =>
-        written(saveConfig({ path: cfgPath, openedText, drafts: [], profile: { name, routing }, confirmExternal, backup: !backedUp })),
+        written(saveConfig({ path: cfgPath, openedText, drafts: [], profile: { name, routing }, confirmExternal, backup: !backedUp, policies, builtin })),
       markReviewed: () => {
         reviewed = mergeSnapshot(reviewed, current)
         writeSnapshot(snapshotFile, reviewed)
@@ -2727,9 +2818,11 @@ export function createRouting(pi: any, deps: Deps = {}) {
       const outcome = refusal ? { reloaded: false as const, message: refusal } : await applyToHost(request.name, ctx, () => applyRefusal(request.name))
       // A reloaded host has replaced this extension runner: touch nothing of it.
       if (outcome.reloaded) return
-      raw = openedText === undefined ? {} : parseJsonc(openedText)
+      raw = openedText === undefined ? {} : parseJsonc(policies.base(openedText, cfgPath))
       resume = { drafts: request.drafts, layer: request.layer, saved: result.saved, profiles: result.profiles ?? [], message: `프로필 ${request.name} 적용 안 됨: ${outcome.message}` }
     }
+    try { applyPolicies() }
+    catch (error) { ctx.ui.notify(`routing: ${errorText(error)}`, "warning") }
     const saved = typeof result?.saved === "number" ? result.saved : 0
     const profilesSaved: string[] = Array.isArray(result?.profiles) ? result.profiles : []
     const backup = backupPath ? ` (previous version: ${backupPath})` : ""
@@ -2741,9 +2834,27 @@ export function createRouting(pi: any, deps: Deps = {}) {
 
   pi.registerCommand("routing", {
     description: "edit the model chains of ~/.omo/omo.jsonc over the installed OMO defaults in an interactive editor",
-    argumentHint: "[--profile <p>|-p <p>|--base]",
+    argumentHint: "[--profile <p>|-p <p>|--base] | policy | refresh | promo on|off | codex on|off",
     handler: async (args: string, ctx: any) => {
       const words = (args ?? "").trim().split(/\s+/).filter(Boolean)
+      if (["refresh", "policy", "promo", "codex"].includes(words[0])) {
+        try {
+          const [command, value] = words
+          if (command === "policy" && words.length === 1) {
+            ctx.ui.notify(policies.details(), "info")
+            return
+          }
+          if (command === "refresh" && words.length === 1) await policies.refresh()
+          else if ((command === "promo" || command === "codex") && words.length === 2 && (value === "on" || value === "off"))
+            policies.set(command, value === "on")
+          else { ctx.ui.notify("routing: /routing refresh | policy | promo on|off | codex on|off", "error"); return }
+          applyPolicies()
+          ctx.ui?.setStatus?.("omo-routing", policies.status())
+          const errors = policies.state().errors
+          ctx.ui.notify(`${policies.summary()} · 현재 조건으로 다시 적용했습니다${errors.length ? `\n신호 갱신 실패(캐시 유지): ${errors.join("; ")}` : ""}`, errors.length ? "warning" : "info")
+        } catch (error) { ctx.ui.notify(`routing: ${errorText(error)}`, "error") }
+        return
+      }
       // `edit` is the command's former form and still opens the editor.
       await editor(words[0] === "edit" ? words.slice(1) : words, ctx)
     },

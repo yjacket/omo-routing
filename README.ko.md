@@ -14,7 +14,47 @@
 /routing             현재 프로필 레이어, Tab으로 base (프로필이 없으면 base만)
 /routing -p <name>   해당 프로필 레이어 (--profile <name> 도 동일)
 /routing --base      base만, 프로필 오버레이 없음
+/routing policy      임시 정책·공개 신호·출처 확인
+/routing refresh     신호 갱신(1분 캐시) 후 현재 체인 재계산
+/routing promo on|off  OpenGateway 자동 할인 정책 켜기·끄기
+/routing codex on|off  작업 체인의 기존 Codex 후보 수동 우선
 ```
+
+### 임시 정책
+
+편집기는 사용자가 작성한 **base·프로필 체인**과 임시 정책의 기여분을 분리합니다.
+목록에는 최종 체인, 상세에는 기본 설정과 달라진 정책 적용 결과가 나옵니다.
+카테고리를 기본값으로 돌려도 활성 정책은 유지됩니다. 새 프로필에는 임시 모델이
+아닌 작성한 설정만 복사됩니다. 정책은 base와 모든 프로필에 다시 합성하므로
+프로필을 적용해도 할인이 가려지지 않습니다.
+
+- **OpenGateway**: 기본으로 켜집니다. 90% 이상 할인할 때 DeepSeek
+  `deepseek-v4.1-flash-ultrafast`를 quick·explore·librarian 맨 앞에 놓고,
+  알려진 할인 종료 15분 전에 뺍니다. 만료된 캐시로는 켜지 않습니다.
+- **Codex**: 기본은 꺼짐이며 `/routing codex on`으로만 켭니다. 예측이나
+  리셋 이벤트로 자동으로 켜지지 않습니다. 작업 카테고리·에이전트 체인에
+  이미 있는 `chatgpt-subscription`·`openai-codex` 후보만 앞으로 옮기고 모델을
+  추가하지 않습니다. 할인 중인 세 체인에서는 DeepSeek이 우선합니다.
+  비활성 노드와 메인 세션 모델은 바꾸지 않습니다.
+
+세션 시작과 1분 타이머에서 OpenGateway 가격과 Codex Reset의 공개 예측을
+받습니다. `omo-routing` 상태줄은 할인 카운트다운과 24시간 리셋 확률을 짧게
+표시하고, `/routing policy`는 48시간 확률·신뢰도·최근 리셋·출처·수집 오류도
+보여 줍니다. Codex Reset은 공개 예측·이벤트 정보이며 **개인 잔여량이 아닙니다**.
+GET 계약은 https://codex-reset.com/developers/ 에 있고, 수집기는
+`omo-routing/0.1 (+https://github.com/yjacket/omo-routing)`로 자신을 식별합니다.
+
+`~/.omo/routing-policies.json`에는 설정·캐시와 정책이 바꾼 부분만 기록합니다.
+정책을 끌 때 과거 파일 전체를 복원하지 않고 기여분만 제거해 다른 편집을 보존합니다.
+세션 간 잠금과 외부 변경 검사로 저장을 보호합니다. 비정상 종료한 세션이 남긴
+잠금은 30초 뒤 해제됩니다. 정책 적용 중에는 이 기록을
+삭제하지 마세요. 수집 실패 시 기존 캐시를 유지하고 `/routing policy`에 오류를
+표시합니다. 수동 갱신도 1분 제한을 지킵니다. 편집 중 자동 쓰기는 미루고 저장하거나
+닫을 때 재합성합니다.
+
+DeepSeek 프로모션이 적용된 동안 routing은 할인 기간마다 한 번, 압축 뒤에 다시
+입력한 프롬프트에 숨은 안내를 붙여 어떤 경로가 할인 중인지 에이전트에 알립니다.
+프로모션이 끝나면 종료 안내로 이 안내를 철회합니다.
 
 현재 프로필은 `OMO_PROFILE` → `OCX_PROFILE` → `OPENCODE_CONFIG_DIR` 끝 부분
 순으로 정합니다("설정 해석" 참고). `/routing edit ...`은 이전 이름으로 부르는

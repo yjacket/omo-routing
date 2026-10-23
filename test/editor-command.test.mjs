@@ -4,7 +4,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { applyProfile, createRouting, parseJsonc, resolveProfileName } from "../extension/routing.ts"
+import { applyProfile, createRouting, parseJsonc, resolveProfileName, setJsoncPath } from "../extension/routing.ts"
+import { RoutingPolicies } from "../extension/routing-runtime.ts"
 import { fixtureDir } from "./fixture-dir.mjs"
 import { KEY, MODELS, press, screen, select } from "./editor-fixture.mjs"
 
@@ -23,7 +24,7 @@ const CONFIG = `{
  * another extension vetoing; "throw" fails before the lifecycle starts, "late-throw" after
  * session_shutdown; "none" is a host without ctx.reload. After a successful reload the old
  * runner is stale: using its ctx throws. */
-function setup(t, { config = CONFIG, mode = "tui", custom = true, cwd, env: extraEnv = {}, host: hostMode } = {}) {
+function setup(t, { config = CONFIG, mode = "tui", custom = true, cwd, env: extraEnv = {}, host: hostMode, now, fetcher } = {}) {
   const home = fixtureDir("routing-edit-")
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const root = join(home, "omo-ai")
@@ -41,15 +42,19 @@ function setup(t, { config = CONFIG, mode = "tui", custom = true, cwd, env: extr
   let closeHook
   let idleHook
   const notes = []
+  const statuses = []
+  const branch = []
   const env = { OMO_BIN: join(root, "bin", "omo.js"), ...extraEnv }
   const host = { stale: false, opens: 0, order: [], idleEnv: [], vetoes: [], reloads: [] }
   const live = () => { if (host.stale) throw new Error("the old extension runner was used after a successful reload") }
   const events = {}
   const ctx = {
     mode, cwd: typeof cwd === "function" ? cwd(home) : cwd,
+    sessionManager: { getBranch: () => branch },
     modelRegistry: { getAvailable: () => MODELS },
     ui: {
       notify: (message, kind) => { live(); notes.push({ message, kind }) },
+      setStatus: (key, value) => { live(); statuses.push({ key, value }) },
       ...(custom ? {
         custom: (factory, options) => new Promise(done => {
           live()
@@ -77,16 +82,16 @@ function setup(t, { config = CONFIG, mode = "tui", custom = true, cwd, env: extr
       },
     }),
   }
-  createRouting({ registerCommand: (_name, def) => { command = def }, on: (name, fn) => { events[name] = fn } }, { home, env })
+  createRouting({ registerCommand: (_name, def) => { command = def }, on: (name, fn) => { events[name] = fn } }, { home, env, now, fetcher })
   return {
-    home, cfgPath, notes, env, host,
+    home, cfgPath, notes, statuses, branch, env, host,
     /** Run `fn` with the editor's result at the moment it closes, before the command continues. */
     beforeClose: fn => { closeHook = fn },
     duringIdle: fn => { idleHook = fn },
     /** Resolves with the overlay of the next `ui.custom` call (arm it before the key that closes the current one). */
     next: () => new Promise(resolve => { resolveOpen = resolve }),
     /** Deliver a host event (e.g. session_before_reload) and return the handler's result. */
-    fire: name => events[name]({ type: name }, ctx),
+    fire: (name, event = {}) => events[name]({ type: name, ...event }, ctx),
     snapshot: join(home, ".omo", "routing-builtin-snapshot.json"),
     run: args => command.handler(args, ctx),
     hint: () => command.argumentHint,
@@ -223,9 +228,9 @@ test("a profile named __proto__ is refused, and .bak keeps the file from before 
   assert.match(h.notes.at(-1).message, /^routing: saved 2 change\(s\)/)
 })
 
-test("a bare /routing opens the editor; `edit` is the same command; the hint names only the layer options", async t => {
+test("a bare /routing opens the editor; `edit` is the same command; the hint names layers and policies", async t => {
   const h = setup(t)
-  assert.equal(h.hint(), "[--profile <p>|-p <p>|--base]")
+  assert.equal(h.hint(), "[--profile <p>|-p <p>|--base] | policy | refresh | promo on|off | codex on|off")
   const titles = []
   for (const args of ["", "edit"]) {
     const { editor, finished } = await h.open(args)
@@ -563,4 +568,93 @@ test("a profile removed while waiting for idle is rechecked, with unrelated relo
   assert.deepEqual(outcome.editor.pending(), staged)
   press(outcome.editor, "q", "q")
   await finished
+})
+
+const POLICY_NOW = Date.parse("2026-10-23T16:00:00Z")
+const PROMO_MODEL = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast"
+function policyState(h) {
+  const store = new RoutingPolicies(h.home, { now: () => POLICY_NOW })
+  writeFileSync(store.statePath, JSON.stringify({
+    version: 1, promoEnabled: true, codexPreferred: false, codex: null, errors: [], checkedAt: POLICY_NOW,
+    promo: { fetchedAt: POLICY_NOW, discountNow: 0.9, discountNext: 0.5, nextAt: POLICY_NOW + 3_600_000 },
+  }))
+  return store
+}
+
+test("routing reset and policy commands preserve the editable base while the discount stays applied", BOUND, async t => {
+  // Given: an authored quick chain and an active discount.
+  const config = setJsoncPath(CONFIG, ["[native]", "categories", "quick", "models"], ["base/small"])
+  const h = setup(t, { config, now: () => POLICY_NOW })
+  const policies = policyState(h)
+  await h.run("codex on")
+  assert.equal(policies.state().codexPreferred, true)
+  assert.equal(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.quick.models[0], `${PROMO_MODEL}:low`)
+
+  // When: the user follows builtin, saves, and closes the real editor.
+  const { editor, finished } = await h.open("--base")
+  select(editor, "quick")
+  press(editor, "r", "s", "q")
+  await finished
+
+  // Then: only the authored override is removed; turning off the policy restores follow.
+  assert.equal(parseJsonc(policies.base(readFileSync(h.cfgPath, "utf8"), h.cfgPath))["[native]"].categories.quick, undefined)
+  assert.equal(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.quick.models[0], `${PROMO_MODEL}:low`)
+  await h.run("promo off")
+  await h.run("codex off")
+  assert.equal(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.quick, undefined)
+  assert.ok(h.statuses.every(item => item.key === "omo-routing"))
+})
+
+test("applying a saved profile retains the active promotion in the host's resolved routing", BOUND, async t => {
+  const h = setup(t, { config: APPLY_CONFIG, host: "ok", env: { OMO_PROFILE: "work" }, now: () => POLICY_NOW })
+  policyState(h)
+  await h.run("codex off")
+  const { editor, finished } = await h.open("")
+
+  // When: the normal profile menu applies play through the real reload lifecycle.
+  choose(editor, 2)
+  press(editor, KEY.enter)
+  await finished
+
+  // Then: the selected profile still resolves with the discount first.
+  assert.equal(h.env.OMO_PROFILE, "play")
+  assert.equal(h.host.reloads[0].config.categories.quick.models[0], `${PROMO_MODEL}:low`)
+})
+
+test("the integrated prompt hook gates previews and automation and retracts its actual active policy", BOUND, async t => {
+  const h = setup(t, { now: () => POLICY_NOW })
+  policyState(h)
+  await h.run("codex off")
+  assert.equal(await h.fire("before_agent_start", { preview: true }), undefined)
+  assert.equal(await h.fire("before_agent_start", { trigger: "extension" }), undefined)
+  const first = await h.fire("before_agent_start")
+  assert.equal(first.message.customType, "routing-policy")
+  assert.deepEqual(first.message.details, { on: true, window: POLICY_NOW + 3_600_000 })
+  h.branch.push({ type: "custom_message", ...first.message })
+  assert.equal(await h.fire("before_agent_start"), undefined)
+  await h.run("promo off")
+  const ended = await h.fire("before_agent_start")
+  assert.deepEqual(ended.message.details, { on: false })
+  h.branch.push({ type: "custom_message", ...ended.message })
+  assert.equal(await h.fire("before_agent_start"), undefined)
+})
+
+test("late source refresh after session shutdown cannot write routing or reuse the stale UI", BOUND, async t => {
+  const responses = []
+  const fetcher = url => new Promise(resolve => { responses.push({ url: String(url), resolve }) })
+  const h = setup(t, { now: () => POLICY_NOW, fetcher })
+  const started = h.fire("session_start")
+  assert.equal(responses.length, 2)
+  await h.fire("session_shutdown")
+  const statusCount = h.statuses.length
+  h.host.stale = true
+  for (const response of responses) response.resolve(Response.json(response.url.includes("opengateway")
+    ? { entries: { model: {
+      modelName: "deepseek-v4.1-flash-ultrafast", inputCostPerToken: 10, outputCostPerToken: 10,
+      pricing: { current: { effectivePrice: { inputCostPerToken: 1, outputCostPerToken: 1 } } },
+    } } }
+    : { probabilities: { rounded_24h: 80, rounded_48h: 90 }, confidence: "high", updated_at: new Date(POLICY_NOW).toISOString() }))
+  await started
+  assert.equal(readFileSync(h.cfgPath, "utf8"), CONFIG)
+  assert.equal(h.statuses.length, statusCount)
 })

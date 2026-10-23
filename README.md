@@ -14,7 +14,52 @@ of providers the running session is not connected to; it reads no credentials.
 /routing             the current profile's layer, base one Tab away (base alone when no profile is set)
 /routing -p <name>   that profile's layer (also --profile <name>)
 /routing --base      base alone, no profile overlay
+/routing policy      current temporary policies, public signals and their source
+/routing refresh     fetch signals (one-minute cache) and recompose current chains
+/routing promo on|off  enable/disable the automatic OpenGateway discount policy
+/routing codex on|off  manually prefer existing Codex candidates in task chains
 ```
+
+### Temporary policies
+
+The editor writes authored **base/profile chains**, separately from temporary
+policy contributions. Its list shows final chains; the detail pane shows the
+base/profile configuration and, when different, the policy result. Resetting a
+category to follow the builtin resets only the authored chain: an active policy
+still applies. Saving a new profile copies authored routing, not temporary
+models. Policies are recomposed for base and every saved profile, so applying a
+profile does not hide the discount.
+
+- **OpenGateway**: enabled by default. At 90% off or more, DeepSeek
+  `deepseek-v4.1-flash-ultrafast` leads quick/explore/librarian, stopping 15 minutes
+  before a known discount end. Expired cached schedules cannot enable it.
+- **Codex**: off by default and enabled only by `/routing codex on`, never by a
+  forecast or a reset event. Existing `chatgpt-subscription`/`openai-codex`
+  candidates move first in task category/agent chains without adding models.
+  The DeepSeek promotion takes precedence on its three lanes. Disabled nodes
+  and the main-session model are not changed.
+
+Session start and a one-minute timer collect OpenGateway prices and the public
+Codex Reset forecast. The compact `omo-routing` footer retains the discount
+countdown and shows the 24-hour reset probability; `/routing policy` adds the
+48-hour forecast, confidence, last reset, source and fetch errors. Codex Reset
+is a prediction/public-event source, **not personal remaining usage**.
+The GET contract is documented at https://codex-reset.com/developers/.
+Readers identify as `omo-routing/0.1 (+https://github.com/yjacket/omo-routing)`.
+
+`~/.omo/routing-policies.json` stores settings, cached signals and a receipt of
+only the policy-owned edits. Removing a policy reverses those contributions,
+not an old whole-file backup; unrelated edits survive. File writes are guarded
+by a cross-session lock and an external-change check. A lock left behind by a
+crashed session is cleared after 30 seconds. Do not delete the receipt
+while policies are applied. Signal failures keep the previous cache and are
+shown by `/routing policy`; manual refresh also honours the one-minute limit.
+Refresh writes are deferred while the editor has unsaved work. The policy
+reconciles on save or close.
+
+While the DeepSeek promotion is applied, routing adds a hidden note to the typed
+prompt once per discount window, and again after compaction, telling the agent
+which lanes are discounted. When the promotion ends, an end notice retracts it.
 
 The current profile is `OMO_PROFILE` → `OCX_PROFILE` → the tail of
 `OPENCODE_CONFIG_DIR` (see "Config resolution"). `/routing edit ...` is the
