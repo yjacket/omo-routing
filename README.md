@@ -41,8 +41,10 @@ profile does not hide the discount.
 
 Session start and a one-minute timer collect OpenGateway prices and the public
 Codex Reset forecast. The compact `omo-routing` footer retains the discount
-countdown and shows the 24-hour reset probability; `/routing policy` adds the
-48-hour forecast, confidence, last reset, source and fetch errors. Codex Reset
+countdown and shows only Codex Reset's Tibo-based alert: an active ⚠️ Watch
+(Tibo hinted at a reset) with its score and the time to its deadline, or a ✅
+reset confirmed within the last 24 hours. `/routing policy` adds the 24- and
+48-hour forecast, confidence, last reset, the alert, source and fetch errors. Codex Reset
 is a prediction/public-event source, **not personal remaining usage**.
 The GET contract is documented at https://codex-reset.com/developers/.
 Readers identify as `omo-routing/0.1 (+https://github.com/yjacket/omo-routing)`.

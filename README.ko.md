@@ -38,9 +38,10 @@
   비활성 노드와 메인 세션 모델은 바꾸지 않습니다.
 
 세션 시작과 1분 타이머에서 OpenGateway 가격과 Codex Reset의 공개 예측을
-받습니다. `omo-routing` 상태줄은 할인 카운트다운과 24시간 리셋 확률을 짧게
-표시하고, `/routing policy`는 48시간 확률·신뢰도·최근 리셋·출처·수집 오류도
-보여 줍니다. Codex Reset은 공개 예측·이벤트 정보이며 **개인 잔여량이 아닙니다**.
+받습니다. `omo-routing` 상태줄은 할인 카운트다운과, Codex Reset의 Tibo 기반 알림만
+짧게 표시합니다. Tibo가 리셋을 예고한 ⚠️ 공지가 활성이면 점수와 마감까지 남은 시간을,
+24시간 안에 확인된 ✅ 리셋이 있으면 경과 시간을 보여 줍니다. `/routing policy`는
+24·48시간 확률·신뢰도·최근 리셋·알림·출처·수집 오류도 보여 줍니다. Codex Reset은 공개 예측·이벤트 정보이며 **개인 잔여량이 아닙니다**.
 GET 계약은 https://codex-reset.com/developers/ 에 있고, 수집기는
 `omo-routing/0.1 (+https://github.com/yjacket/omo-routing)`로 자신을 식별합니다.
 

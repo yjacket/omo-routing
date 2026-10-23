@@ -20,10 +20,24 @@ export type CodexSignal = {
   readonly last_reset_at: string | null
   readonly updated_at: string | null
   readonly official_signal: boolean
+  /** Absent in caches written before alerts were read; treated as null. */
+  readonly alert?: CodexAlert | null
+}
+
+/** The documented `latest_alert`: a ⚠️ Watch (Tibo hinted at a reset; `score` is
+ * the site's 83/93 tier, `endsAt` its deadline) or a ✅ Reset. `at` is when the
+ * reset was observed, else when the source was posted. */
+export type CodexAlert = {
+  readonly kind: "watch" | "reset"
+  readonly state: "active" | "expired" | "confirmed"
+  readonly at: string
+  readonly score: number | null
+  readonly endsAt: string | null
 }
 
 const USER_AGENT = "omo-routing/0.1 (+https://github.com/yjacket/omo-routing)"
 const STALE_MS = 5 * 60_000
+const DAY_MS = 24 * 3_600_000
 export const POLICY_MESSAGE_TYPE = "routing-policy"
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -38,11 +52,16 @@ export function isCodexSignal(value: unknown): value is CodexSignal {
     || (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100)
   const date = (value: unknown): boolean => value === null
     || (typeof value === "string" && Number.isFinite(Date.parse(value)))
+  const alert = record(data?.alert)
+  const alertOk = data?.alert === undefined || data.alert === null || (!!alert
+    && (alert.kind === "watch" || alert.kind === "reset")
+    && (alert.state === "active" || alert.state === "expired" || alert.state === "confirmed")
+    && typeof alert.at === "string" && date(alert.at) && odds(alert.score) && date(alert.endsAt))
   return !!data && !!probabilities
     && odds(probabilities.rounded_24h) && odds(probabilities.rounded_48h)
     && (data.confidence === null || typeof data.confidence === "string")
     && date(data.last_reset_at) && date(data.updated_at)
-    && typeof data.official_signal === "boolean"
+    && typeof data.official_signal === "boolean" && alertOk
 }
 
 async function fetchJson(url: string, fetcher: typeof fetch): Promise<{ body: unknown; response: Response }> {
@@ -110,6 +129,17 @@ function timestamp(value: unknown): string | null {
   return value
 }
 
+function alertOf(value: unknown): CodexAlert | null {
+  if (value === null || value === undefined) return null
+  const alert = record(value)
+  if (!alert || (alert.kind !== "watch" && alert.kind !== "reset")
+    || (alert.state !== "active" && alert.state !== "expired" && alert.state !== "confirmed")
+    || (alert.window != null && !record(alert.window))) throw new Error("Invalid Codex alert")
+  const at = timestamp(alert.observed_at) ?? timestamp(alert.source_at)
+  if (at === null) throw new Error("Invalid Codex alert")
+  return { kind: alert.kind, state: alert.state, at, score: probability(alert.score), endsAt: timestamp(record(alert.window)?.end_at) }
+}
+
 /** Public reset forecasts only. Call no more than once per minute.
  * https://codex-reset.com/developers/ is the primary contract. */
 export async function fetchCodexSignal(fetcher: typeof fetch = fetch): Promise<CodexSignal> {
@@ -128,7 +158,29 @@ export async function fetchCodexSignal(fetcher: typeof fetch = fetch): Promise<C
     last_reset_at: timestamp(data.last_reset_at),
     updated_at: timestamp(data.updated_at),
     official_signal: data.official_signal != null,
+    alert: alertOf(data.latest_alert),
   }
+}
+
+const span = (ms: number): string => {
+  const minutes = Math.floor(ms / 60_000)
+  const hours = Math.floor(minutes / 60)
+  return hours >= 24 ? `${hours}h` : hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`
+}
+
+/** The Codex part of the footer: only Tibo-based alerts, an active watch with
+ * its deadline or a reset confirmed within a day. The forecast stays in details. */
+function codexStatus(codex: CodexSignal | null, now: number): string | undefined {
+  const alert = codex?.alert ?? null
+  let text: string | undefined
+  if (alert?.kind === "watch" && alert.state === "active") {
+    const ends = alert.endsAt === null ? NaN : Date.parse(alert.endsAt)
+    text = `리셋 임박${alert.score === null ? "" : ` ${alert.score}%`}${ends > now ? ` ~${span(ends - now)}` : ""}`
+  } else if (alert?.kind === "reset" && alert.state === "confirmed" && now - Date.parse(alert.at) < DAY_MS) {
+    text = `리셋됨 ${span(Math.max(0, now - Date.parse(alert.at)))} 전`
+  }
+  if (text && (!codex?.updated_at || now - Date.parse(codex.updated_at) > STALE_MS)) text += " (오래됨)"
+  return text
 }
 
 /** Footer only: stale data stays visibly stale, never an account quota or reset guarantee. */
@@ -144,27 +196,14 @@ export function signalStatus(
     const percent = Math.round(((changed ? promo.discountNext : promo.discountNow) ?? 0) * 100)
     if (percent > 0) {
       let text = `deepseek ${percent}%`
-      if (promo.nextAt !== null && !changed) {
-        const minutes = Math.floor((promo.nextAt - now) / 60_000)
-        const hours = Math.floor(minutes / 60)
-        text += ` ~${hours >= 24 ? `${hours}h` : hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`}`
-      }
+      if (promo.nextAt !== null && !changed) text += ` ~${span(promo.nextAt - now)}`
       if (changed || now - promo.fetchedAt > STALE_MS) text += " (오래됨)"
       parts.push(text)
     }
   }
-  if (codex || codexPreferred) {
-    const prefix = codexPreferred ? "Codex 우선" : "Codex"
-    if (!codex) {
-      parts.push(`${prefix} 리셋 예측 확인 불가`)
-    } else {
-      const odds = (value: number | null): string => value === null ? "?" : `${value}%`
-      let text = `${prefix} 예측 24h ${odds(codex.probabilities.rounded_24h)}`
-      if (!codex.updated_at) text += " (갱신 미상)"
-      else if (now - Date.parse(codex.updated_at) > STALE_MS) text += " (오래됨)"
-      parts.push(text)
-    }
-  }
+  const codexText = codexStatus(codex, now)
+  if (codexPreferred) parts.push(codexText ? `Codex 우선 · ${codexText}` : "Codex 우선")
+  else if (codexText) parts.push(`Codex ${codexText}`)
   return parts.length ? parts.join(" | ") : undefined
 }
 

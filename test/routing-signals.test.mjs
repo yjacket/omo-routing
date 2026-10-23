@@ -81,12 +81,26 @@ test("Codex keeps only displayed documented fields and percentages, not raw mode
   assert.deepEqual(signal, {
     probabilities: { rounded_24h: 32, rounded_48h: 53 },
     confidence: "low", last_reset_at: "2026-10-22T17:10:01.000Z",
-    updated_at: ISO, official_signal: true,
+    updated_at: ISO, official_signal: true, alert: null,
   })
   assert.deepEqual(await fetchCodexSignal(async () => response({ probabilities: {} })), {
     probabilities: { rounded_24h: null, rounded_48h: null },
-    confidence: null, last_reset_at: null, updated_at: null, official_signal: false,
+    confidence: null, last_reset_at: null, updated_at: null, official_signal: false, alert: null,
   })
+  // latest_alert keeps only kind, state, time, score and the window's deadline.
+  const ends = new Date(NOW + 3_600_000).toISOString()
+  const watching = { ...forecast(), latest_alert: {
+    id: "1", kind: "watch", state: "active", source_at: ISO, summary: "soon", url: null, score: 93, corrected: false,
+    window: { label: "within an hour", start_at: ISO, end_at: ends, time_zone: "America/Los_Angeles" },
+  } }
+  assert.deepEqual((await fetchCodexSignal(async () => response(watching))).alert,
+    { kind: "watch", state: "active", at: ISO, score: 93, endsAt: ends })
+  const observed = new Date(NOW - 60_000).toISOString()
+  const reset = { ...forecast(), latest_alert: {
+    id: "2", kind: "reset", state: "confirmed", source_at: ISO, observed_at: observed, summary: "done", score: null, window: null, corrected: true,
+  } }
+  assert.deepEqual((await fetchCodexSignal(async () => response(reset))).alert,
+    { kind: "reset", state: "confirmed", at: observed, score: null, endsAt: null })
   const zero = forecast()
   zero.probabilities = { rounded_24h: 0, rounded_48h: 100 }
   zero.official_signal = null
@@ -114,7 +128,10 @@ test("fetch failures reject without retries or replacing cached data", async () 
     body.probabilities.rounded_24h = value
     await assert.rejects(fetchCodexSignal(async () => response(body)))
   }
-  for (const [key, value] of [["updated_at", "invalid"], ["last_reset_at", 123], ["confidence", {}], ["official_signal", true]]) {
+  for (const [key, value] of [
+    ["updated_at", "invalid"], ["last_reset_at", 123], ["confidence", {}], ["official_signal", true],
+    ["latest_alert", { kind: "soon", state: "active", source_at: ISO }], ["latest_alert", { kind: "watch", state: "active" }],
+  ]) {
     await assert.rejects(fetchCodexSignal(async () => response({ ...forecast(), [key]: value })))
   }
 })
@@ -130,11 +147,16 @@ test("persisted decoder validates all normalized fields without throwing on unkn
   for (const value of [null, undefined, 0, "", [], {}, forecast()]) {
     assert.equal(isCodexSignal(value), false)
   }
-  for (const key of Object.keys(valid)) {
+  // Caches written before alerts were read have no alert and stay valid.
+  const { alert: _alert, ...older } = valid
+  assert.equal(isCodexSignal(older), true)
+  for (const key of Object.keys(older)) {
     const incomplete = { ...valid }
     delete incomplete[key]
     assert.equal(isCodexSignal(incomplete), false)
   }
+  for (const alert of [1, { kind: "watch" }, { kind: "watch", state: "active", at: "invalid", score: null, endsAt: null }])
+    assert.equal(isCodexSignal({ ...valid, alert }), false)
   for (const value of [NaN, Infinity, -1, 101, "32", undefined]) {
     assert.equal(isCodexSignal({ ...valid, probabilities: { ...valid.probabilities, rounded_24h: value } }), false)
     assert.equal(isCodexSignal({ ...valid, probabilities: { ...valid.probabilities, rounded_48h: value } }), false)
@@ -181,19 +203,21 @@ test("promo footer keeps discount switch and minute/hour countdown boundaries", 
   assert.equal(signalStatus(null, null, false, NOW), undefined)
 })
 
-test("compact Codex footer exposes forecast tokens and differentiates stale, unknown and preference", async () => {
+test("compact Codex footer shows only Tibo alerts: an active watch countdown or a reset within a day", async () => {
   const signal = await fetchCodexSignal(async () => response(forecast()))
-  const current = signalStatus(null, signal, false, NOW)
-  assert.deepEqual(tokens(current), ["24h", "32%"])
-  assert.notEqual(current, signalStatus(null, signal, true, NOW))
-  assert.notEqual(current, signalStatus(null, { ...signal, updated_at: new Date(NOW - 300_001).toISOString() }, false, NOW))
-  assert.notEqual(current, signalStatus(null, { ...signal, updated_at: null }, false, NOW))
-  assert.ok(signalStatus(null, null, true, NOW))
-  const unknown = { ...signal, probabilities: { rounded_24h: null, rounded_48h: null } }
-  assert.deepEqual(tokens(signalStatus(null, unknown, false, NOW)), ["24h"])
+  assert.equal(signalStatus(null, signal, false, NOW), undefined)
+  assert.equal(signalStatus(null, null, true, NOW), "Codex 우선")
+  const watch = { ...signal, alert: { kind: "watch", state: "active", at: ISO, score: 93, endsAt: new Date(NOW + 90 * 60_000).toISOString() } }
+  assert.deepEqual(tokens(signalStatus(null, watch, false, NOW)), ["93%", "~1h 30m"])
+  assert.match(signalStatus(null, watch, true, NOW), /^Codex 우선 · /)
+  assert.equal(signalStatus(null, { ...watch, alert: { ...watch.alert, state: "expired" } }, false, NOW), undefined)
+  assert.notEqual(signalStatus(null, watch, false, NOW), signalStatus(null, { ...watch, updated_at: new Date(NOW - 300_001).toISOString() }, false, NOW))
+  const reset = { ...signal, alert: { kind: "reset", state: "confirmed", at: new Date(NOW - 2 * 3_600_000).toISOString(), score: null, endsAt: null } }
+  assert.match(signalStatus(null, reset, false, NOW), /리셋됨 2h 0m 전/)
+  assert.equal(signalStatus(null, { ...reset, alert: { ...reset.alert, at: new Date(NOW - 24 * 3_600_000).toISOString() } }, false, NOW), undefined)
   const promo = { fetchedAt: NOW, discountNow: 0.9, nextAt: null, discountNext: null }
   assert.notEqual(signalStatus(promo, null, false, NOW), signalStatus({ ...promo, fetchedAt: NOW - 300_001 }, null, false, NOW))
-  assert.deepEqual(tokens(signalStatus(promo, signal, true, NOW)), ["90%", "24h", "32%"])
+  assert.deepEqual(tokens(signalStatus(promo, watch, false, NOW)), ["90%", "93%", "~1h 30m"])
 })
 
 test("hidden messages emit once per window, reemit after compaction and retract once", () => {

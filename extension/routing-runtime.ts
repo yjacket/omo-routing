@@ -228,6 +228,10 @@ export class RoutingPolicies {
       const confidence: Record<string, string> = { low: "낮음", medium: "중간", high: "높음" }
       lines.push(`Codex 리셋 예측: 24h ${codex.probabilities.rounded_24h ?? "?"}% · 48h ${codex.probabilities.rounded_48h ?? "?"}%`)
       lines.push(`신뢰 ${confidence[codex.confidence ?? ""] ?? "미상"} · 최근 리셋 ${codex.last_reset_at?.slice(0, 10) ?? "미상"}${codex.official_signal ? " · 공식 신호 있음" : ""}`)
+      const alert = codex.alert ?? null
+      const utc = (iso: string): string => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`
+      if (alert?.kind === "watch") lines.push(`Tibo 알림: 리셋 임박 공지${alert.score === null ? "" : ` ${alert.score}%`}${alert.state !== "active" ? " · 만료" : alert.endsAt ? ` · 마감 ${utc(alert.endsAt)}` : ""}`)
+      if (alert?.kind === "reset") lines.push(`Tibo 알림: 리셋 확인 ${utc(alert.at)}`)
       lines.push("출처: codex-reset.com · 개인 잔여량이 아닙니다")
     }
     lines.push("/routing refresh · /routing promo on|off · /routing codex on|off", ...state.errors)
