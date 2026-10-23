@@ -33,11 +33,25 @@ test("promotion requires a known current window and stops exactly fifteen minute
 
 test("promotion prefixes only the three lanes and preserves builtin fallback candidates", () => {
   const result = compose("{}")
-  assert.deepEqual(chain(result.text, "categories", "quick"), [PROMO, ...chain("{}", "categories", "quick")])
-  assert.deepEqual(chain(result.text, "agents", "explore"), [PROMO, ...chain("{}", "agents", "explore")])
+  assert.deepEqual(chain(result.text, "categories", "quick"), [PROMO, ...new Set(chain("{}", "categories", "quick"))])
+  assert.deepEqual(chain(result.text, "agents", "explore"), [PROMO, ...new Set(chain("{}", "agents", "explore"))])
   assert.deepEqual(chain(result.text, "agents", "librarian"), [PROMO])
   assert.deepEqual(chain(result.text, "categories", "deep"), chain("{}", "categories", "deep"))
   assert.deepEqual(config(result.text).agents.explore.models[0], { model: PROMO.slice(0, -4), variant: "low" })
+})
+
+test("promotion pins distinct builtin candidates but leaves unchanged resolution intact", () => {
+  const builtin = structuredClone(BUILTIN)
+  const fallback = chain("{}", "categories", "quick", undefined, builtin)
+  builtin.defaults.categoryModels.quick = fallback[0]
+  const resolvedQuick = chain("{}", "categories", "quick", undefined, builtin)
+  assert.equal(resolvedQuick[0], resolvedQuick[1])
+  const resolvedDeep = chain("{}", "categories", "deep", undefined, builtin)
+  const result = compose("{}", settings, builtin)
+  const promoted = chain(result.text, "categories", "quick", undefined, builtin)
+  assert.deepEqual(promoted, [PROMO, ...new Set(resolvedQuick)])
+  assert.ok(promoted.every((spec, i) => i === 0 || spec !== promoted[i - 1]))
+  assert.deepEqual(chain(result.text, "categories", "deep", undefined, builtin), resolvedDeep)
 })
 
 test("every profile receives promotion after its own root and harness inheritance", () => {

@@ -27,7 +27,7 @@ function fixture(t, fetcher) {
   const path = join(home, ".omo", "omo.jsonc")
   writeFileSync(path, SRC)
   let now = NOW
-  const policies = new RoutingPolicies(home, { now: () => now, ...(fetcher ? { fetcher } : {}) })
+  const policies = new RoutingPolicies(home, { now: () => now, lockWaitMs: 50, ...(fetcher ? { fetcher } : {}) })
   writeFileSync(policies.statePath, JSON.stringify({
     version: 1, promoEnabled: true, codexPreferred: false, codex: null, errors: [], checkedAt: 0,
     promo: { fetchedAt: NOW, discountNow: 0.9, discountNext: 0.5, nextAt: NOW + 3_600_000 },

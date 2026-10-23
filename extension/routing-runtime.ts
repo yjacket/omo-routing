@@ -7,6 +7,8 @@ import { fetchCodexSignal, fetchPromoSchedule, isCodexSignal, signalStatus } fro
 import type { CodexSignal } from "./routing-signals.ts"
 import type { BuiltinRouting } from "./routing.ts"
 
+const SLEEP = new Int32Array(new SharedArrayBuffer(4))
+
 type PolicyState = {
   readonly version: 1
   readonly promoEnabled: boolean
@@ -47,13 +49,15 @@ export class RoutingPolicies {
   private readonly home: string
   private readonly now: () => number
   private readonly fetcher: typeof fetch
+  private readonly lockWaitMs: number
 
-  constructor(home: string, options: { readonly now?: () => number; readonly fetcher?: typeof fetch } = {}) {
+  constructor(home: string, options: { readonly now?: () => number; readonly fetcher?: typeof fetch; readonly lockWaitMs?: number } = {}) {
     this.home = home
     this.statePath = join(home, ".omo", "routing-policies.json")
     this.lockPath = `${this.statePath}.lock`
     this.now = options.now ?? Date.now
     this.fetcher = options.fetcher ?? fetch
+    this.lockWaitMs = options.lockWaitMs ?? 2_000
   }
 
   state(): PolicyState {
@@ -89,15 +93,29 @@ export class RoutingPolicies {
 
   private locked<T>(action: () => T): T {
     mkdirSync(dirname(this.statePath), { recursive: true })
-    try {
-      mkdirSync(this.lockPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-      // A crashed process leaves its lock directory behind; mtimes are wall clock.
-      if (Date.now() - statSync(this.lockPath).mtimeMs <= 30_000)
-        throw new Error("routing policies are being saved by another session; try again")
-      rmdirSync(this.lockPath)
-      mkdirSync(this.lockPath)
+    // Sessions reload together after a config write, so a busy lock is normal:
+    // wait briefly for its holder, and clear one left behind by a crash.
+    const deadline = Date.now() + this.lockWaitMs
+    for (;;) {
+      try {
+        mkdirSync(this.lockPath)
+        break
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+      }
+      let age: number
+      try {
+        age = Date.now() - statSync(this.lockPath).mtimeMs
+      } catch (error) {
+        if (missing(error)) continue
+        throw error
+      }
+      if (age > 30_000) {
+        try { rmdirSync(this.lockPath) } catch (error) { if (!missing(error)) throw error }
+        continue
+      }
+      if (Date.now() >= deadline) throw new Error("routing policies are being saved by another session; try again")
+      Atomics.wait(SLEEP, 0, 0, 25)
     }
     try { return action() } finally { rmdirSync(this.lockPath) }
   }

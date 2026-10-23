@@ -50,8 +50,9 @@ Readers identify as `omo-routing/0.1 (+https://github.com/yjacket/omo-routing)`.
 `~/.omo/routing-policies.json` stores settings, cached signals and a receipt of
 only the policy-owned edits. Removing a policy reverses those contributions,
 not an old whole-file backup; unrelated edits survive. File writes are guarded
-by a cross-session lock and an external-change check. A lock left behind by a
-crashed session is cleared after 30 seconds. Do not delete the receipt
+by a cross-session lock and an external-change check. A busy lock is waited on
+for up to 2 seconds; one left behind by a crashed session is cleared after 30
+seconds. Do not delete the receipt
 while policies are applied. Signal failures keep the previous cache and are
 shown by `/routing policy`; manual refresh also honours the one-minute limit.
 Refresh writes are deferred while the editor has unsaved work. The policy

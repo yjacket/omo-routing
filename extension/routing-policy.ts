@@ -145,8 +145,11 @@ export function composePolicies(baseText: string, settings: PolicySettings, buil
           const providers = [...parsed.providers.filter(provider => CODEX.has(provider)), ...parsed.providers.filter(provider => !CODEX.has(provider))]
           return `{${providers.join("|")}}${spec.slice(spec.indexOf("/"))}`
         }
-        const wanted = promotional ? [PROMO, ...chain.filter(spec => spec !== PROMO)]
+        const reordered = promotional ? [PROMO, ...chain]
           : settings.codex ? [...chain.filter(codex), ...chain.filter(spec => !codex(spec))].map(preferCodex) : chain
+        // A chain the policy rewrites is pinned into the config: drop the exact
+        // repeats OMO's builtin resolution yields (primary, then fallbacks led by it).
+        const wanted = isDeepStrictEqual(reordered, chain) ? chain : [...new Set(reordered)]
         const current = resolveRouting(applyProfile(parseJsonc(text), profile).config, builtin)
         const actual: string[] = current.config[section][name]?.models ?? []
         if (isDeepStrictEqual(actual, wanted)) continue
