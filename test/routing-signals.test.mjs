@@ -34,7 +34,7 @@ const response = (body, headers = {}) => Response.json(body, { headers })
 const branchEntry = message => ({ type: "custom_message", ...message })
 const tokens = text => text?.match(/\d+%|~\d+h(?: \d+m)?|~\d+m|24h|48h/g)
 
-test("promo fetch accepts wrapped and legacy entries, minimum input/output discount and server time", async () => {
+test("promo fetch accepts wrapped and legacy entries, minimum input/output discount and the local clock", async () => {
   for (const wrapped of [false, true]) {
     let calls = 0
     const entries = { unrelated: { modelName: "other" }, target: entry() }
@@ -43,8 +43,9 @@ test("promo fetch accepts wrapped and legacy entries, minimum input/output disco
       assert.equal(url, "https://opengateway.ai/api/model-prices")
       assert.equal(init.headers["User-Agent"], AGENT)
       assert.ok(init.signal instanceof AbortSignal)
-      return response(wrapped ? { entries, priceVersion: 1 } : entries, { "X-Model-Price-Server-Time": ISO })
-    })
+      // A server clock running ahead must not date the schedule into the future.
+      return response(wrapped ? { entries, priceVersion: 1 } : entries, { "X-Model-Price-Server-Time": new Date(NOW + 5_000).toISOString() })
+    }, () => NOW)
     assert.equal(calls, 1)
     assert.deepEqual(result, {
       fetchedAt: NOW, discountNow: 0.8, nextAt: NOW + 90 * 60_000, discountNext: 0.5,

@@ -200,7 +200,7 @@ export class RoutingPolicies {
       return true
     })
     if (!claimed) return
-    const results = await Promise.allSettled([fetchPromoSchedule(this.fetcher), fetchCodexSignal(this.fetcher)])
+    const results = await Promise.allSettled([fetchPromoSchedule(this.fetcher, this.now), fetchCodexSignal(this.fetcher)])
     this.locked(() => {
       const state = this.state()
       const promo = results[0]

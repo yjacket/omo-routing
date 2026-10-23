@@ -217,3 +217,25 @@ test("an unchanged recomposition rewrites neither the config nor the state file"
   assert.equal(readFileSync(h.path, "utf8"), disk)
   assert.equal(readFileSync(h.policies.statePath, "utf8"), compact)
 })
+
+test("a server clock running ahead does not switch the promotion off right after a refresh", async t => {
+  // Given: OpenGateway reports 90% off with its clock five seconds ahead of ours.
+  const fetcher = async url => String(url).includes("opengateway")
+    ? new Response(JSON.stringify({ entries: { deepseek: {
+      modelName: "deepseek-v4.1-flash-ultrafast", inputCostPerToken: 10, outputCostPerToken: 10,
+      pricing: {
+        current: { effectivePrice: { inputCostPerToken: 1, outputCostPerToken: 1 } },
+        next: { at: new Date(NOW + 3_600_000).toISOString(), effectivePrice: { inputCostPerToken: 5, outputCostPerToken: 5 } },
+      },
+    } } }), { headers: { "X-Model-Price-Server-Time": new Date(NOW + 5_000).toISOString() } })
+    : new Response(JSON.stringify({ probabilities: { rounded_24h: 10, rounded_48h: 20 } }))
+  const h = fixture(t, fetcher)
+
+  // When: the session that refreshed recomposes at once.
+  await h.policies.refresh()
+  h.apply()
+
+  // Then: the schedule is dated by our clock and the promotion still leads quick.
+  assert.equal(h.policies.state().promo.fetchedAt, NOW)
+  assert.equal(config(h.path)["[native]"].categories.quick.models[0], `${MODEL}:low`)
+})

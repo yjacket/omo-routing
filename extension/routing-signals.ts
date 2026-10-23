@@ -71,9 +71,11 @@ function discountOf(entry: Record<string, unknown>, price: unknown): number {
   return discount
 }
 
-/** One bounded GET, no retries; failures leave retention of prior data to the caller. */
-export async function fetchPromoSchedule(fetcher: typeof fetch = fetch): Promise<PromoSchedule> {
-  const { body, response } = await fetchJson("https://opengateway.ai/api/model-prices", fetcher)
+/** One bounded GET, no retries; failures leave retention of prior data to the caller.
+ * `fetchedAt` is this machine's clock, the one the policy compares it with: a
+ * server clock running ahead must not make a fresh schedule look future-dated. */
+export async function fetchPromoSchedule(fetcher: typeof fetch = fetch, now: () => number = Date.now): Promise<PromoSchedule> {
+  const { body } = await fetchJson("https://opengateway.ai/api/model-prices", fetcher)
   const envelope = record(body)
   const entries = envelope?.entries ?? body
   if (entries === null || typeof entries !== "object") throw new Error("Invalid OpenGateway price list")
@@ -84,9 +86,8 @@ export async function fetchPromoSchedule(fetcher: typeof fetch = fetch): Promise
   const current = record(pricing?.current)
   const next = record(pricing?.next)
   const nextAt = typeof next?.at === "string" ? Date.parse(next.at) : NaN
-  const serverTime = Date.parse(response.headers.get("X-Model-Price-Server-Time") ?? "")
   return {
-    fetchedAt: Number.isFinite(serverTime) ? serverTime : Date.now(),
+    fetchedAt: now(),
     discountNow: discountOf(entry, current?.effectivePrice),
     nextAt: Number.isFinite(nextAt) ? nextAt : null,
     discountNext: next ? discountOf(entry, next.effectivePrice) : null,
