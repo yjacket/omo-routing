@@ -6,6 +6,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node
 import { join } from "node:path"
 import { applyProfile, createRouting, parseJsonc, resolveProfileName, setJsoncPath } from "../extension/routing.ts"
 import { RoutingPolicies } from "../extension/routing-runtime.ts"
+import { overlayKey } from "../extension/routing-policy.ts"
 import { fixtureDir } from "./fixture-dir.mjs"
 import { KEY, MODELS, press, screen, select } from "./editor-fixture.mjs"
 
@@ -228,9 +229,9 @@ test("a profile named __proto__ is refused, and .bak keeps the file from before 
   assert.match(h.notes.at(-1).message, /^routing: saved 2 change\(s\)/)
 })
 
-test("a bare /routing opens the editor; `edit` is the same command; the hint names layers and policies", async t => {
+test("a bare /routing opens the editor; `edit` is the same command; the hint names layers only", async t => {
   const h = setup(t)
-  assert.equal(h.hint(), "[--profile <p>|-p <p>|--base] | policy | refresh | promo on|off | codex on|off")
+  assert.equal(h.hint(), "[--profile <p>|-p <p>|--base]")
   const titles = []
   for (const args of ["", "edit"]) {
     const { editor, finished } = await h.open(args)
@@ -241,6 +242,18 @@ test("a bare /routing opens the editor; `edit` is the same command; the hint nam
   assert.match(titles[0], /편집 레이어: base/)
   assert.equal(titles[1], titles[0])
   assert.equal(readFileSync(h.cfgPath, "utf8"), CONFIG)
+})
+
+test("the removed policy subcommands are rejected without writing config or policy state", async t => {
+  const h = setup(t)
+  for (const args of ["policy", "refresh", "promo on", "promo off", "codex on", "codex off"]) {
+    await h.run(args)
+    assert.equal(h.notes.at(-1).kind, "error")
+    assert.match(h.notes.at(-1).message, /is not an option; use \/routing/)
+  }
+  assert.equal(h.host.opens, 0)
+  assert.equal(readFileSync(h.cfgPath, "utf8"), CONFIG)
+  assert.equal(existsSync(join(h.home, ".omo", "routing-policies.json")), false)
 })
 
 const nameProfile = (editor, name) => press(editor, "p", KEY.enter, ...name, KEY.enter)
@@ -575,19 +588,26 @@ const PROMO_MODEL = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast"
 function policyState(h) {
   const store = new RoutingPolicies(h.home, { now: () => POLICY_NOW })
   writeFileSync(store.statePath, JSON.stringify({
-    version: 1, promoEnabled: true, codexPreferred: false, codex: null, errors: [], checkedAt: POLICY_NOW,
+    version: 1, promoEnabled: true, switchProfile: null, codex: null, errors: [], checkedAt: POLICY_NOW,
     promo: { fetchedAt: POLICY_NOW, discountNow: 0.9, discountNext: 0.5, nextAt: POLICY_NOW + 3_600_000 },
   }))
   return store
 }
 
-test("routing reset and policy commands preserve the editable base while the discount stays applied", BOUND, async t => {
+async function setPromo(h, on) {
+  new RoutingPolicies(h.home, { now: () => POLICY_NOW }).setPromo(on)
+  const { editor, finished } = await h.open("")
+  press(editor, "q")
+  await finished
+}
+
+test("routing reset and policy settings preserve the editable base while the discount stays applied", BOUND, async t => {
   // Given: an authored quick chain and an active discount.
   const config = setJsoncPath(CONFIG, ["[native]", "categories", "quick", "models"], ["base/small"])
   const h = setup(t, { config, now: () => POLICY_NOW })
   const policies = policyState(h)
-  await h.run("codex on")
-  assert.equal(policies.state().codexPreferred, true)
+  await setPromo(h, true)
+  assert.equal(policies.state().promoEnabled, true)
   assert.equal(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.quick.models[0], `${PROMO_MODEL}:low`)
 
   // When: the user follows builtin, saves, and closes the real editor.
@@ -599,8 +619,7 @@ test("routing reset and policy commands preserve the editable base while the dis
   // Then: only the authored override is removed; turning off the policy restores follow.
   assert.equal(parseJsonc(policies.base(readFileSync(h.cfgPath, "utf8"), h.cfgPath))["[native]"].categories.quick, undefined)
   assert.equal(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.quick.models[0], `${PROMO_MODEL}:low`)
-  await h.run("promo off")
-  await h.run("codex off")
+  await setPromo(h, false)
   assert.equal(parseJsonc(readFileSync(h.cfgPath, "utf8"))["[native]"].categories.quick, undefined)
   assert.ok(h.statuses.every(item => item.key === "omo-routing"))
 })
@@ -608,7 +627,7 @@ test("routing reset and policy commands preserve the editable base while the dis
 test("applying a saved profile retains the active promotion in the host's resolved routing", BOUND, async t => {
   const h = setup(t, { config: APPLY_CONFIG, host: "ok", env: { OMO_PROFILE: "work" }, now: () => POLICY_NOW })
   policyState(h)
-  await h.run("codex off")
+  await setPromo(h, true)
   const { editor, finished } = await h.open("")
 
   // When: the normal profile menu applies play through the real reload lifecycle.
@@ -624,7 +643,7 @@ test("applying a saved profile retains the active promotion in the host's resolv
 test("the integrated prompt hook gates previews and automation and retracts its actual active policy", BOUND, async t => {
   const h = setup(t, { now: () => POLICY_NOW })
   policyState(h)
-  await h.run("codex off")
+  await setPromo(h, true)
   assert.equal(await h.fire("before_agent_start", { preview: true }), undefined)
   assert.equal(await h.fire("before_agent_start", { trigger: "extension" }), undefined)
   const first = await h.fire("before_agent_start")
@@ -632,11 +651,67 @@ test("the integrated prompt hook gates previews and automation and retracts its 
   assert.deepEqual(first.message.details, { on: true, window: POLICY_NOW + 3_600_000 })
   h.branch.push({ type: "custom_message", ...first.message })
   assert.equal(await h.fire("before_agent_start"), undefined)
-  await h.run("promo off")
+  await setPromo(h, false)
   const ended = await h.fire("before_agent_start")
   assert.deepEqual(ended.message.details, { on: false })
   h.branch.push({ type: "custom_message", ...ended.message })
   assert.equal(await h.fire("before_agent_start"), undefined)
+})
+
+test("the policy menu persists promo toggles and cycles every saved switch profile back to off", BOUND, async t => {
+  const h = setup(t, { config: APPLY_CONFIG, now: () => POLICY_NOW })
+  const policies = policyState(h)
+  const { editor, finished } = await h.open("")
+  press(editor, "p", "\x1b[F", KEY.up, KEY.enter)
+  assert.equal(policies.state().promoEnabled, false)
+  press(editor, KEY.enter)
+  assert.equal(policies.state().promoEnabled, true)
+  press(editor, KEY.down)
+  for (const name of ["work", "play", null]) {
+    press(editor, KEY.enter)
+    assert.equal(policies.state().switchProfile, name)
+  }
+  press(editor, KEY.esc, "q")
+  await finished
+})
+
+test("saving chains during an active switch excludes only each edited layer and preserves its authored chain", BOUND, async t => {
+  const config = JSON.stringify({
+    "[native]": { categories: { deep: { models: ["base/deep"] } } },
+    profiles: {
+      work: { "[native]": { categories: { deep: { models: ["work/deep"] } } } },
+      target: { "[native]": { categories: { deep: { models: ["target/deep"] }, quick: { models: ["target/quick"] } } } },
+    },
+  })
+  const h = setup(t, { config, now: () => POLICY_NOW })
+  const policies = policyState(h)
+  writeFileSync(policies.statePath, JSON.stringify({
+    ...policies.state(), promoEnabled: false, switchProfile: "target",
+    codex: {
+      probabilities: { rounded_24h: 90, rounded_48h: 95 }, confidence: "high",
+      last_reset_at: null, updated_at: new Date(POLICY_NOW).toISOString(), official_signal: false,
+      alert: { kind: "watch", state: "active", at: new Date(POLICY_NOW).toISOString(), score: 93, endsAt: null },
+    },
+  }))
+  await setPromo(h, false)
+  assert.deepEqual(applyProfile(parseJsonc(readFileSync(h.cfgPath, "utf8")), "work").config.categories.deep.models, ["target/deep"])
+  const { editor, finished } = await h.open("-p work")
+  select(editor, "deep")
+  press(editor, KEY.enter, "b", KEY.esc, KEY.tab)
+  select(editor, "deep")
+  press(editor, KEY.enter, "b", "s")
+  assert.deepEqual(policies.state().switchExclude, {
+    alert: new Date(POLICY_NOW).toISOString(),
+    keys: [overlayKey("work", "categories", "deep"), overlayKey(undefined, "categories", "deep")],
+  })
+  const saved = parseJsonc(readFileSync(h.cfgPath, "utf8"))
+  for (const profile of [undefined, "work"])
+    assert.deepEqual(applyProfile(saved, profile).config.categories.deep.models, ["chatgpt-subscription/gpt-big:high"])
+  assert.deepEqual(applyProfile(saved, "work").config.categories.quick.models, ["target/quick"], "unedited nodes stay overlaid")
+  assert.deepEqual(saved.profiles.target["[native]"].categories.deep.models, ["target/deep"])
+  press(editor, KEY.esc, "q")
+  await finished
+  assert.deepEqual(applyProfile(parseJsonc(readFileSync(h.cfgPath, "utf8")), "work").config.categories.deep.models, ["chatgpt-subscription/gpt-big:high"])
 })
 
 test("late source refresh after session shutdown cannot write routing or reuse the stale UI", BOUND, async t => {

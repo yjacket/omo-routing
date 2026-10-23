@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { createHash } from "node:crypto"
 import { RoutingPolicies } from "../extension/routing-runtime.ts"
 import { applyDrafts, applyProfile, parseJsonc, saveConfig } from "../extension/routing.ts"
-import { composePolicies } from "../extension/routing-policy.ts"
+import { composePolicies, overlayKey } from "../extension/routing-policy.ts"
 import { BUILTIN } from "./editor-fixture.mjs"
 
 const MODEL = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast"
@@ -29,7 +29,7 @@ function fixture(t, fetcher) {
   let now = NOW
   const policies = new RoutingPolicies(home, { now: () => now, lockWaitMs: 50, ...(fetcher ? { fetcher } : {}) })
   writeFileSync(policies.statePath, JSON.stringify({
-    version: 1, promoEnabled: true, codexPreferred: false, codex: null, errors: [], checkedAt: 0,
+    version: 1, promoEnabled: true, switchProfile: null, codex: null, errors: [], checkedAt: 0,
     promo: { fetchedAt: NOW, discountNow: 0.9, discountNext: 0.5, nextAt: NOW + 3_600_000 },
   }))
   const apply = () => {
@@ -106,19 +106,84 @@ test("an unrelated external edit survives policy removal, and a stale save still
   assert.deepEqual(config(h.path), parseJsonc(SRC))
 })
 
-test("Codex is manual, changes only existing task candidates, and can be removed without restoring an old file", t => {
+test("switch watches overlay target nodes and close by restoring the authored text byte for byte", t => {
   const h = fixture(t)
-  h.policies.set("promo", false)
-
-  // When: Codex preference is explicitly enabled and then disabled.
-  h.policies.set("codex", true)
+  h.policies.setPromo(false)
+  h.policies.setSwitchProfile("work")
+  const state = h.policies.state()
+  const codex = {
+    probabilities: { rounded_24h: 93, rounded_48h: 99 }, confidence: "high",
+    last_reset_at: null, updated_at: new Date(NOW).toISOString(), official_signal: false,
+    alert: { kind: "watch", state: "active", at: new Date(NOW).toISOString(), score: 93, endsAt: null },
+  }
+  const update = patch => writeFileSync(h.policies.statePath, JSON.stringify({ ...h.policies.state(), ...patch }))
+  update({ codex })
+  assert.equal(h.policies.switching(), "work")
+  assert.equal(h.policies.switching(parseJsonc(SRC)), "work")
+  assert.match(h.policies.status(), / → work$/)
   h.apply()
-  assert.deepEqual(config(h.path)["[native]"].categories.deep.models, ["chatgpt-subscription/gpt-big:high", "other/large"])
-  h.policies.set("codex", false)
-  h.apply()
+  assert.deepEqual(config(h.path)["[native]"].categories.quick.models, ["base/profile"])
+  for (const alert of [
+    { ...codex.alert, state: "expired" },
+    { ...codex.alert, endsAt: new Date(NOW).toISOString() },
+    { ...codex.alert, kind: "reset", state: "confirmed" },
+  ]) {
+    update({ codex: { ...codex, alert } })
+    assert.equal(h.policies.switching(), null)
+    h.apply()
+    assert.equal(readFileSync(h.path, "utf8"), SRC)
+  }
+  update({ codex })
+  h.policies.setSwitchProfile(null)
+  assert.equal(h.policies.preview(SRC, BUILTIN).text, SRC)
+  h.policies.setSwitchProfile("absent")
+  assert.equal(h.policies.switching(), null)
+  assert.equal(h.policies.preview(SRC, BUILTIN).text, SRC)
+  assert.equal(state.switchProfile, "work")
+})
 
-  // Then: the authored order and whole base config are unchanged.
-  assert.deepEqual(config(h.path), parseJsonc(SRC))
+test("switch exclusions preserve edited chains for their layer and lapse on the next watch", t => {
+  const h = fixture(t)
+  h.policies.setPromo(false)
+  h.policies.setSwitchProfile("work")
+  const codex = {
+    probabilities: { rounded_24h: null, rounded_48h: null }, confidence: null,
+    last_reset_at: null, updated_at: null, official_signal: false,
+    alert: { kind: "watch", state: "active", at: new Date(NOW).toISOString(), score: null, endsAt: null },
+  }
+  writeFileSync(h.policies.statePath, JSON.stringify({ ...h.policies.state(), codex }))
+  h.apply()
+  const key = overlayKey(undefined, "categories", "quick")
+  h.policies.exclude([key])
+  h.policies.exclude([key])
+  assert.deepEqual(h.policies.state().switchExclude, { alert: codex.alert.at, keys: [key] })
+  const disk = readFileSync(h.path, "utf8")
+  const base = h.policies.base(disk, h.path)
+  const edited = applyDrafts(base, [{ section: "categories", name: "quick", chain: ["edited/quick"], disable: null }])
+  h.policies.write({ path: h.path, base: edited, current: disk, baseBefore: base, builtin: BUILTIN, backup: false })
+  assert.deepEqual(config(h.path)["[native]"].categories.quick.models, ["edited/quick"])
+  assert.deepEqual(config(h.path).profiles.work["[native]"].categories.quick.models, ["base/profile"])
+  const next = { ...codex, alert: { ...codex.alert, at: new Date(NOW + 1).toISOString() } }
+  writeFileSync(h.policies.statePath, JSON.stringify({ ...h.policies.state(), codex: next }))
+  h.apply()
+  assert.deepEqual(config(h.path)["[native]"].categories.quick.models, ["base/profile"])
+  const other = overlayKey("work", "agents", "explore")
+  h.policies.exclude([other])
+  assert.deepEqual(h.policies.state().switchExclude.keys, [other])
+  h.policies.setSwitchProfile(null)
+  const before = readFileSync(h.policies.statePath, "utf8")
+  h.policies.exclude([key])
+  assert.equal(readFileSync(h.policies.statePath, "utf8"), before)
+})
+
+test("legacy settings without a switch are accepted and obsolete fields disappear on persist", t => {
+  const h = fixture(t)
+  const { switchProfile: _switch, ...legacy } = h.policies.state()
+  const obsolete = ["codex", "Preferred"].join("")
+  writeFileSync(h.policies.statePath, JSON.stringify({ ...legacy, [obsolete]: true }))
+  assert.equal(h.policies.state().switchProfile, null)
+  h.policies.setPromo(false)
+  assert.equal(Object.hasOwn(JSON.parse(readFileSync(h.policies.statePath, "utf8")), obsolete), false)
 })
 
 test("the cross-session lock and changed receipt refuse a write rather than replacing newer edits", t => {
@@ -136,7 +201,7 @@ test("a pending journal unwraps the correct receipt before and after the config 
   const oldBase = h.policies.base(oldDisk, h.path)
   const state = h.policies.state()
   const edited = applyDrafts(oldBase, [{ section: "categories", name: "quick", chain: ["base/new"], disable: null }])
-  const pending = composePolicies(edited, { promo: state.promo, codex: false }, BUILTIN, NOW)
+  const pending = composePolicies(edited, { promo: state.promo, overlay: null }, BUILTIN, NOW)
   writeFileSync(h.policies.statePath, JSON.stringify({
     ...state, pending: {
       configPath: h.path, digest: createHash("sha256").update(pending.text).digest("hex"), receipt: pending.receipt,
@@ -152,19 +217,19 @@ test("a lock directory left by a crashed process is recovered", t => {
   mkdirSync(h.policies.lockPath)
   const old = new Date(Date.now() - 60_000)
   utimesSync(h.policies.lockPath, old, old)
-  h.policies.set("codex", true)
-  assert.equal(h.policies.state().codexPreferred, true)
+  h.policies.setSwitchProfile("work")
+  assert.equal(h.policies.state().switchProfile, "work")
   assert.equal(existsSync(h.policies.lockPath), false)
 })
 
 test("a fresh lock directory blocks another session", t => {
   const h = fixture(t)
   mkdirSync(h.policies.lockPath)
-  assert.throws(() => h.policies.set("codex", true), /another session/)
-  assert.equal(h.policies.state().codexPreferred, false)
+  assert.throws(() => h.policies.setSwitchProfile("work"), /another session/)
+  assert.equal(h.policies.state().switchProfile, null)
 })
 
-test("refresh caches the two sources for a minute and never enables manual Codex on a public signal", async t => {
+test("refresh caches the two sources for a minute and leaves the switch setting off", async t => {
   const requests = []
   const fetcher = async url => {
     requests.push(String(url))
@@ -184,9 +249,9 @@ test("refresh caches the two sources for a minute and never enables manual Codex
   // When: two refreshes happen inside one source-cache window.
   await Promise.all([h.policies.refresh(), h.policies.refresh()])
 
-  // Then: each source was fetched only once; prediction never activates Codex.
+  // Then: each source was fetched only once; prediction never enables switching.
   assert.equal(requests.length, 2)
-  assert.equal(h.policies.state().codexPreferred, false)
+  assert.equal(h.policies.state().switchProfile, null)
   assert.ok(h.policies.state().codex)
   assert.ok(existsSync(h.policies.statePath))
 })

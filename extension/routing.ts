@@ -27,6 +27,7 @@ import { pathToFileURL } from "node:url"
 import { createContext, runInContext } from "node:vm"
 import { isDeepStrictEqual } from "node:util"
 import { RoutingPolicies } from "./routing-runtime.ts"
+import { overlayKey } from "./routing-policy.ts"
 import { promoMessage, nudge } from "./routing-signals.ts"
 
 /** `cwd` is where OMO looks for project `.omo/omo.jsonc` files (default: ctx.cwd). */
@@ -1618,7 +1619,11 @@ export type EditorOptions = {
   drift?: Drift
   warnings?: readonly string[]
   /** Editing always uses raw base chains; these callbacks are display-only. */
-  policySummary?: string
+  policies?: {
+    view: () => { promo: boolean; switchProfile: string | null; switching: boolean; summary: string; lines: readonly string[] }
+    setPromo: (on: boolean) => void
+    setSwitchProfile: (name: string | null) => void
+  }
   policyConfig?: (raw: unknown) => unknown
   configPath?: string
   levels?: (model: ModelInfo | undefined) => string[]
@@ -1940,12 +1945,31 @@ export class RoutingEditor {
   /** The profile menu: row 0 saves the current routing as a new profile, then the existing profiles. */
   private profilesKey(key: string, mode: ProfilesMode): void {
     const names = profileNames(this.raw)
+    const policies = this.options.policies
+    const last = names.length + (policies ? 2 : 0)
     switch (key) {
       case "up": mode.cursor = Math.max(0, mode.cursor - 1); return
-      case "down": mode.cursor = Math.min(names.length, mode.cursor + 1); return
+      case "down": mode.cursor = Math.min(last, mode.cursor + 1); return
       case "home": case "pgup": mode.cursor = 0; return
-      case "end": case "pgdn": mode.cursor = names.length; return
+      case "end": case "pgdn": mode.cursor = last; return
       case "enter": case "right": {
+        if (policies && mode.cursor > names.length) {
+          try {
+            const view = policies.view()
+            if (mode.cursor === names.length + 1) {
+              policies.setPromo(!view.promo)
+              this.say(`DeepSeek 할인 자동 ${view.promo ? "끔" : "켬"}`, "success")
+            } else {
+              const next = names[(view.switchProfile === null ? -1 : names.indexOf(view.switchProfile)) + 1] ?? null
+              policies.setSwitchProfile(next)
+              this.say(`리셋 공지 때 전환 ${next ?? "끔"}`, "success")
+            }
+            this.changed()
+          } catch (error) {
+            this.say(errorText(error), "error")
+          }
+          return
+        }
         if (mode.cursor === 0) {
           this.mode = { kind: "name", text: "" }
           return
@@ -2255,7 +2279,7 @@ export class RoutingEditor {
     const body = mode.kind === "list" ? this.listItems(nodes, iw)
       : mode.kind === "chain" ? this.chainItems(focus as EditorNode, mode)
       : mode.kind === "picker" ? this.pickerItems(mode) : mode.kind === "effort" ? this.effortItems(mode)
-      : mode.kind === "profiles" ? this.profileItems(mode) : mode.kind === "apply" ? this.applyItems(mode, iw) : this.nameItems(mode)
+      : mode.kind === "profiles" ? this.profileItems(mode, iw) : mode.kind === "apply" ? this.applyItems(mode, iw) : this.nameItems(mode)
     const listLength = mode.kind === "list" ? body.items.length : this.listItems(nodes, iw).items.length
     let detailRows = Math.min(DETAIL_ROWS, Math.floor(room * 0.4), room - 4)
     if (detailRows < 2) detailRows = 0
@@ -2350,7 +2374,7 @@ export class RoutingEditor {
   private headerItems(width: number): Item[] {
     const { availability, warnings = [] } = this.options
     const items: Item[] = []
-    if (this.options.policySummary) items.push(...this.wrapped(this.options.policySummary, width, "muted"))
+    if (this.options.policies) items.push(...this.wrapped(this.options.policies.view().summary, width, "muted"))
     items.push(...this.wrapped(availability.known
       ? `연결된 프로바이더: ${availability.providers.map(labelProvider).join(", ") || "없음"} · 미연결 후보 ${this.showHidden ? "표시 중" : "숨김"} (h)`
       : `구독 정보를 읽지 못해 모든 후보를 표시합니다 (${availability.reason})`, width, availability.known ? "muted" : "warning"))
@@ -2381,7 +2405,7 @@ export class RoutingEditor {
       case "picker":
         return "글자 입력: 필터 · Backspace 지우기 · ↑↓ 이동 · Enter 선택 · Esc 취소"
       case "profiles":
-        return "↑↓ 이동 · Enter 선택 · Esc 목록"
+        return "↑↓ 이동 · Enter 선택/바꾸기 · Esc 목록"
       case "name":
         return "이름 입력 (붙여넣기 가능) · Backspace 지우기 · Enter 저장 · Esc 취소"
       case "apply":
@@ -2480,9 +2504,10 @@ export class RoutingEditor {
     return { items, focus: models.length ? 1 + mode.pick : 1 }
   }
 
-  private profileItems(mode: ProfilesMode): { items: Item[]; focus: number } {
+  private profileItems(mode: ProfilesMode, width: number): { items: Item[]; focus: number } {
     const names = profileNames(this.raw)
-    mode.cursor = Math.min(mode.cursor, names.length)
+    const policies = this.options.policies?.view()
+    mode.cursor = Math.min(mode.cursor, names.length + (policies ? 2 : 0))
     const row = (index: number, text: string): Item => {
       const selected = index === mode.cursor
       return { text: `${selected ? "▸" : " "} ${text}`, color: selected ? "accent" : undefined, bold: selected }
@@ -2492,7 +2517,15 @@ export class RoutingEditor {
       const tags = [...(name === this.options.profile ? ["편집 중"] : []), ...(name === this.options.active ? ["활성"] : [])]
       items.push(row(index + 1, `${name}${tags.map(tag => ` · ${tag}`).join("")}`))
     }
-    return { items, focus: 1 + mode.cursor }
+    if (policies) {
+      items.push(
+        { text: "정책", bold: true, header: true },
+        row(names.length + 1, `DeepSeek 할인 자동 · ${policies.promo ? "켬" : "끔"}`),
+        row(names.length + 2, `리셋 공지 때 전환 · ${policies.switchProfile ?? "끔"}${policies.switching ? " · 전환 중" : ""}`),
+        ...policies.lines.flatMap(line => this.wrapped(line, width, "dim")),
+      )
+    }
+    return { items, focus: 1 + mode.cursor + (mode.cursor > names.length ? 1 : 0) }
   }
 
   private applyItems(mode: ApplyMode, width: number): { items: Item[]; focus: number } {
@@ -2781,13 +2814,25 @@ export function createRouting(pi: any, deps: Deps = {}) {
     }
     const open = (resume?: EditorResume) => ctx.ui.custom((tui: any, theme: any, keybindings: any, done: (result: EditorResult) => void) => new RoutingEditor({
       raw, builtin, availability, profile, omo, warnings, configPath: cfgPath,
-      policySummary: policies.summary(),
+      policies: {
+        view: () => {
+          const state = policies.state()
+          return {
+            promo: state.promoEnabled, switchProfile: state.switchProfile, switching: policies.switching() !== null,
+            summary: policies.summary(), lines: policies.details().split("\n").slice(1),
+          }
+        },
+        setPromo: on => policies.setPromo(on),
+        setSwitchProfile: name => policies.setSwitchProfile(name),
+      },
       policyConfig: base => parseJsonc(policies.preview(JSON.stringify(base), builtin).text),
       active: resolveProfileName(env), resume, selectProfile: applyRefusal,
       drift: reviewed ? snapshotDrift(reviewed, current) : undefined,
       levels: model => effortLevels(model, levels),
       save: (drafts, confirmExternal) => {
         // .bak keeps the file as it was before this session's first save.
+        if (policies.switching() !== null)
+          policies.exclude(drafts.map(draft => overlayKey(draft.profile, draft.section, draft.name)))
         return written(saveConfig({ path: cfgPath, openedText, drafts, confirmExternal, backup: !backedUp, policies, builtin }))
       },
       saveProfile: (name, routing, confirmExternal) =>
@@ -2834,27 +2879,9 @@ export function createRouting(pi: any, deps: Deps = {}) {
 
   pi.registerCommand("routing", {
     description: "edit the model chains of ~/.omo/omo.jsonc over the installed OMO defaults in an interactive editor",
-    argumentHint: "[--profile <p>|-p <p>|--base] | policy | refresh | promo on|off | codex on|off",
+    argumentHint: "[--profile <p>|-p <p>|--base]",
     handler: async (args: string, ctx: any) => {
       const words = (args ?? "").trim().split(/\s+/).filter(Boolean)
-      if (["refresh", "policy", "promo", "codex"].includes(words[0])) {
-        try {
-          const [command, value] = words
-          if (command === "policy" && words.length === 1) {
-            ctx.ui.notify(policies.details(), "info")
-            return
-          }
-          if (command === "refresh" && words.length === 1) await policies.refresh()
-          else if ((command === "promo" || command === "codex") && words.length === 2 && (value === "on" || value === "off"))
-            policies.set(command, value === "on")
-          else { ctx.ui.notify("routing: /routing refresh | policy | promo on|off | codex on|off", "error"); return }
-          applyPolicies()
-          ctx.ui?.setStatus?.("omo-routing", policies.status())
-          const errors = policies.state().errors
-          ctx.ui.notify(`${policies.summary()} · 현재 조건으로 다시 적용했습니다${errors.length ? `\n신호 갱신 실패(캐시 유지): ${errors.join("; ")}` : ""}`, errors.length ? "warning" : "info")
-        } catch (error) { ctx.ui.notify(`routing: ${errorText(error)}`, "error") }
-        return
-      }
       // `edit` is the command's former form and still opens the editor.
       await editor(words[0] === "edit" ? words.slice(1) : words, ctx)
     },

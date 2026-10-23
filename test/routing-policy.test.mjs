@@ -1,14 +1,14 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import * as r from "../extension/routing.ts"
-import { composePolicies, unwrapPolicies, isPolicyReceipt, emptyPolicyReceipt } from "../extension/routing-policy.ts"
+import { composePolicies, unwrapPolicies, isPolicyReceipt, emptyPolicyReceipt, overlayKey } from "../extension/routing-policy.ts"
 import { BUILTIN } from "./editor-fixture.mjs"
 
 const NOW = Date.UTC(2026, 9, 23, 12)
 const PROMO = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast:low"
 const SCHEDULE = { fetchedAt: NOW - 60_000, discountNow: 0.9, nextAt: NOW + 3_600_000, discountNext: 0 }
-const settings = { promo: SCHEDULE, codex: false }
-const off = { promo: null, codex: false }
+const settings = { promo: SCHEDULE, overlay: null }
+const off = { promo: null, overlay: null }
 const json = value => JSON.stringify(value, null, 2)
 const config = (text, profile) => r.applyProfile(r.parseJsonc(text), profile).config
 const resolved = (text, profile, builtin = BUILTIN) => r.resolveRouting(config(text, profile), builtin)
@@ -23,12 +23,12 @@ test("promotion requires a known current window and stops exactly fifteen minute
     { ...SCHEDULE, nextAt: Infinity }, { ...SCHEDULE, discountNow: Infinity },
   ]
   for (const promo of schedules) {
-    const result = compose("{ /* keep */ }", { promo, codex: false })
+    const result = compose("{ /* keep */ }", { promo, overlay: null })
     assert.equal(result.promoActive, false)
     assert.equal(result.text, "{ /* keep */ }")
   }
-  assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW + 900_001 }, codex: false }).promoActive, true)
-  assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW + 1, discountNext: 0.9 }, codex: false }).promoActive, true)
+  assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW + 900_001 }, overlay: null }).promoActive, true)
+  assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW + 1, discountNext: 0.9 }, overlay: null }).promoActive, true)
 })
 
 test("promotion prefixes only the three lanes and preserves builtin fallback candidates", () => {
@@ -85,41 +85,46 @@ test("disabled nodes remain disabled while profiles can explicitly enable them",
   assert.equal(chain(result.text, "categories", "quick", "enabled")[0], PROMO)
 })
 
-test("Codex preference stably reorders only existing candidates and preserves main routing", () => {
+test("overlay replaces only target-owned nodes across layers and preserves object rungs and main routing", () => {
   const base = json({
     model: "main/current", model_profile: "capable",
     model_profiles: { capable: { models: ["anthropic-subscription/main", "openai-codex/main"] } },
-    categories: { work: { models: ["other/one", "openai-codex/two:high", "other/three", "chatgpt-subscription/four:low"] }, solo: { models: ["other/solo"] } },
-    agents: { worker: { model: { model: "other/primary", variant: "high", note: 1 }, models: [{ model: "openai-codex/agent", variant: "max", note: 2 }, "other/fallback"] } },
+    categories: { work: { models: ["base/work"] }, solo: { models: ["other/solo"] } },
+    agents: { worker: { model: "base/worker" } },
+    profiles: {
+      switch: { "[native]": { categories: { work: { models: ["target/work", "target/work"] } }, agents: { worker: { model: null, models: [{ model: "target/agent", variant: "max", note: 2 }] } } } },
+      other: { categories: { work: { models: ["other/work"] } }, agents: { worker: { model: "other/worker" } } },
+    },
   })
-  const result = compose(base, { promo: null, codex: true })
-  assert.deepEqual(chain(result.text, "categories", "work"), ["openai-codex/two:high", "chatgpt-subscription/four:low", "other/one", "other/three"])
-  assert.deepEqual(config(result.text).agents.worker.models, [
-    { model: "openai-codex/agent", variant: "max", note: 2 }, { model: "other/primary", variant: "high", note: 1 }, "other/fallback",
-  ])
+  const result = compose(base, { promo: null, overlay: { profile: "switch", exclude: [] } })
+  assert.equal(result.overlayActive, true)
+  for (const profile of [undefined, "other"]) {
+    assert.deepEqual(chain(result.text, "categories", "work", profile), ["target/work"])
+    assert.deepEqual(config(result.text, profile).agents.worker.models, [{ model: "target/agent", variant: "max", note: 2 }])
+    assert.equal(config(result.text, profile).agents.worker.model, null)
+  }
+  assert.deepEqual(r.parseJsonc(result.text).profiles.switch, r.parseJsonc(base).profiles.switch)
   assert.deepEqual(config(result.text).categories.solo, config(base).categories.solo)
   for (const key of ["model", "model_profile", "model_profiles"]) assert.deepEqual(config(result.text)[key], config(base)[key])
-  assert.deepEqual(r.parseJsonc(unwrapPolicies(result.text, result.receipt)), r.parseJsonc(base))
+  assert.equal(unwrapPolicies(result.text, result.receipt), base)
 })
 
-test("Codex preference also reorders providers inside an existing builtin group", () => {
-  const builtin = structuredClone(BUILTIN)
-  builtin.defaults.categories.deep = [{ providers: ["other", "openai-codex", "last"], model: "gpt-big", variant: "high" }]
-  const result = compose("{}", { promo: null, codex: true }, builtin)
-  // resolveRouting expands builtin provider groups into concrete candidates.
-  assert.deepEqual(chain(result.text, "categories", "deep", undefined, builtin), [
-    "openai-codex/gpt-big:high", "other/gpt-big:high", "last/gpt-big:high",
-  ])
-  assert.deepEqual(r.parseJsonc(unwrapPolicies(result.text, result.receipt)), {})
-})
-test("promo wins its lanes while Codex reorders other lanes without injecting candidates", () => {
-  const base = json({ categories: {
-    quick: { models: ["other/first", "openai-codex/quick"] },
-    deep: { models: ["other/deep", "chatgpt-subscription/deep:high"] },
-  } })
-  const result = compose(base, { promo: SCHEDULE, codex: true })
-  assert.deepEqual(chain(result.text, "categories", "quick"), [PROMO, "other/first", "openai-codex/quick"])
-  assert.deepEqual(chain(result.text, "categories", "deep"), ["chatgpt-subscription/deep:high", "other/deep"])
+test("promo leads overlay lanes, disabled nodes stay untouched and exclusions are per layer", () => {
+  const base = json({
+    categories: { quick: { models: ["base/quick"] }, stopped: { models: ["base/stopped"], disable: true } },
+    profiles: {
+      switch: { "[senpi]": { categories: { quick: { models: ["target/quick"] }, stopped: { models: ["target/stopped"] }, blocked: { disable: true } }, agents: { explore: { models: ["target/explore"] }, librarian: { models: ["target/library"] } } } },
+      excluded: { categories: { quick: { models: ["edited/quick"] } } },
+    },
+  })
+  const result = compose(base, { promo: SCHEDULE, overlay: { profile: "switch", exclude: [overlayKey("excluded", "categories", "quick")] } })
+  assert.deepEqual(chain(result.text, "categories", "quick"), [PROMO, "target/quick"])
+  assert.deepEqual(chain(result.text, "categories", "quick", "excluded"), [PROMO, "edited/quick"])
+  assert.deepEqual(chain(result.text, "agents", "explore"), [PROMO, "target/explore"])
+  assert.deepEqual(chain(result.text, "agents", "librarian"), [PROMO, "target/library"])
+  assert.deepEqual(config(result.text).categories.stopped, config(base).categories.stopped)
+  assert.deepEqual(chain(result.text, "categories", "blocked"), chain(base, "categories", "blocked"))
+  assert.equal(unwrapPolicies(result.text, result.receipt), base)
 })
 
 test("a promo category does not downgrade unrelated agents that inherit that category", () => {
@@ -130,14 +135,13 @@ test("a promo category does not downgrade unrelated agents that inherit that cat
   assert.equal(chain(result.text, "agents", "explore", undefined, builtin)[0], PROMO)
 })
 
-test("profile Codex order is derived from fresh base rather than composed base", () => {
-  const base = json({ categories: { quick: { model: "other/base" } }, profiles: {
-    personal: { categories: { quick: { model: "other/profile", fallback_models: ["openai-codex/personal"] } } },
-    plain: { categories: { quick: { model: "other/plain" } } },
-  } })
-  const result = compose(base, { promo: null, codex: true })
-  assert.deepEqual(chain(result.text, "categories", "quick", "personal"), ["openai-codex/personal", "other/profile"])
-  assert.deepEqual(chain(result.text, "categories", "quick", "plain"), ["other/plain"])
+test("an absent overlay target leaves the authored text unchanged", () => {
+  for (const profiles of [{}, { missing: null }, { missing: [] }]) {
+    const base = json({ profiles })
+    const result = compose(base, { promo: null, overlay: { profile: "missing", exclude: [] } })
+    assert.equal(result.overlayActive, false)
+    assert.equal(result.text, base)
+  }
 })
 
 test("unwrapping retains unrelated edits inside inserted containers and comments", () => {
@@ -160,10 +164,10 @@ test("an unwritten receipt is harmless and deleted or edited chain leaves stay u
 })
 
 test("comments inside a rewritten models array survive composition and exact value restoration", () => {
-  const base = '{ "categories": { "quick": { "models": [/* fallback */ "other/first", "openai-codex/second"] } } }'
-  const result = compose(base, { promo: null, codex: true })
+  const base = '{ "categories": { "quick": { "models": [/* fallback */ "other/first", "openai-codex/second"] } }, "profiles": { "switch": { "categories": { "quick": { "models": ["target/quick"] } } } } }'
+  const result = compose(base, { promo: null, overlay: { profile: "switch", exclude: [] } })
   assert.ok(result.text.includes("/* fallback */"))
-  assert.deepEqual(chain(result.text, "categories", "quick"), ["openai-codex/second", "other/first"])
+  assert.deepEqual(chain(result.text, "categories", "quick"), ["target/quick"])
   assert.equal(unwrapPolicies(result.text, result.receipt), base)
 })
 
@@ -202,11 +206,11 @@ test("save as profile snapshots only basic routing and all profiles recompose fr
   assert.deepEqual(config(json(plain), "new"), {})
 })
 
-test("on-off-on is reversible and turning off Codex keeps active promotion", () => {
-  const base = json({ categories: { deep: { models: ["other/deep", "openai-codex/deep"] } } })
-  const both = compose(base, { promo: SCHEDULE, codex: true })
+test("on-off-on is reversible and turning off overlay keeps active promotion", () => {
+  const base = json({ categories: { deep: { models: ["other/deep"] } }, profiles: { switch: { categories: { deep: { models: ["target/deep"] } } } } })
+  const both = compose(base, { promo: SCHEDULE, overlay: { profile: "switch", exclude: [] } })
   const promo = compose(unwrapPolicies(both.text, both.receipt), settings)
-  assert.deepEqual(chain(promo.text, "categories", "deep"), ["other/deep", "openai-codex/deep"])
+  assert.deepEqual(chain(promo.text, "categories", "deep"), ["other/deep"])
   assert.equal(chain(promo.text, "categories", "quick")[0], PROMO)
   const stopped = compose(unwrapPolicies(promo.text, promo.receipt), off)
   assert.deepEqual(r.parseJsonc(stopped.text), r.parseJsonc(base))

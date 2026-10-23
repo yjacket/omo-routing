@@ -3,17 +3,19 @@ import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { composePolicies, isPolicyReceipt, unwrapPolicies } from "./routing-policy.ts"
-import type { PolicyReceipt, PromoSchedule } from "./routing-policy.ts"
+import type { PolicyReceipt, PolicySettings, PromoSchedule } from "./routing-policy.ts"
 import { fetchCodexSignal, fetchPromoSchedule, isCodexSignal, signalStatus } from "./routing-signals.ts"
 import type { CodexSignal } from "./routing-signals.ts"
 import type { BuiltinRouting } from "./routing.ts"
+import { parseJsonc } from "./routing.ts"
 
 const SLEEP = new Int32Array(new SharedArrayBuffer(4))
 
 type PolicyState = {
   readonly version: 1
   readonly promoEnabled: boolean
-  readonly codexPreferred: boolean
+  readonly switchProfile: string | null
+  readonly switchExclude?: { readonly alert: string; readonly keys: readonly string[] }
   readonly promo: PromoSchedule | null
   readonly codex: CodexSignal | null
   readonly checkedAt: number
@@ -32,7 +34,7 @@ const schedule = (value: unknown): value is PromoSchedule => record(value)
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const missing = (error: unknown): boolean => error instanceof Error && "code" in error && error.code === "ENOENT"
 const initial = (): PolicyState => ({
-  version: 1, promoEnabled: true, codexPreferred: false, promo: null, codex: null, checkedAt: 0, errors: [],
+  version: 1, promoEnabled: true, switchProfile: null, promo: null, codex: null, checkedAt: 0, errors: [],
 })
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex")
 
@@ -85,7 +87,10 @@ export class RoutingPolicies {
       return initial()
     }
     if (!record(value) || value.version !== 1 || typeof value.promoEnabled !== "boolean"
-      || typeof value.codexPreferred !== "boolean" || !(value.promo === null || schedule(value.promo))
+      || !(value.switchProfile === undefined || value.switchProfile === null || typeof value.switchProfile === "string")
+      || !(value.switchExclude === undefined || (record(value.switchExclude) && typeof value.switchExclude.alert === "string"
+        && Array.isArray(value.switchExclude.keys) && value.switchExclude.keys.every(key => typeof key === "string")))
+      || !(value.promo === null || schedule(value.promo))
       || !finite(value.checkedAt) || !Array.isArray(value.errors) || !value.errors.every(e => typeof e === "string")
       || !(value.configPath === undefined || typeof value.configPath === "string")
       || !(value.receipt === undefined || isPolicyReceipt(value.receipt))
@@ -97,7 +102,8 @@ export class RoutingPolicies {
       throw new Error(`cannot read Codex signal: ${this.statePath}`)
     const codex = value.codex
     return {
-      version: 1, promoEnabled: value.promoEnabled, codexPreferred: value.codexPreferred,
+      version: 1, promoEnabled: value.promoEnabled, switchProfile: value.switchProfile ?? null,
+      ...(record(value.switchExclude) ? { switchExclude: { alert: value.switchExclude.alert as string, keys: value.switchExclude.keys as string[] } } : {}),
       promo: value.promo, codex, checkedAt: value.checkedAt, errors: value.errors,
       ...(value.configPath === undefined ? {} : { configPath: value.configPath }),
       ...(value.receipt === undefined ? {} : { receipt: value.receipt }),
@@ -149,7 +155,36 @@ export class RoutingPolicies {
 
   preview(base: string, builtin: BuiltinRouting) {
     const state = this.state()
-    return composePolicies(base, { promo: state.promoEnabled ? state.promo : null, codex: state.codexPreferred }, builtin, this.now())
+    return composePolicies(base, this.settings(state, state.switchProfile === null ? undefined : parseJsonc(base)), builtin, this.now())
+  }
+
+  private activeProfile(state: PolicyState, raw: unknown): string | null {
+    const alert = state.codex?.alert
+    const profiles = record(raw) && record(raw.profiles) ? raw.profiles : undefined
+    return state.switchProfile !== null && profiles && Object.hasOwn(profiles, state.switchProfile)
+      && record(profiles[state.switchProfile]) && alert?.kind === "watch" && alert.state === "active"
+      && (alert.endsAt === null || Date.parse(alert.endsAt) > this.now()) ? state.switchProfile : null
+  }
+
+  /** Accept a parsed authored config, or read and unwrap the home config. */
+  switching(raw?: unknown): string | null {
+    const state = this.state()
+    if (state.switchProfile === null) return null
+    if (raw === undefined) {
+      const path = join(this.home, ".omo", "omo.jsonc")
+      raw = existsSync(path) ? parseJsonc(this.base(readFileSync(path, "utf8"), path)) : {}
+    }
+    return this.activeProfile(state, raw)
+  }
+
+  private settings(state: PolicyState, raw: unknown): PolicySettings {
+    const profile = this.activeProfile(state, raw)
+    return {
+      promo: state.promoEnabled ? state.promo : null,
+      overlay: profile === null ? null : {
+        profile, exclude: state.switchExclude?.alert === state.codex?.alert?.at ? state.switchExclude.keys : [],
+      },
+    }
   }
 
   /** Compare the file and receipt again under a cross-session lock. Publish the
@@ -167,7 +202,7 @@ export class RoutingPolicies {
       if (disk !== options.current || (disk !== undefined && this.base(disk, options.path) !== options.baseBefore))
         throw new Error("omo.jsonc or routing policies changed during the save; try again")
       const state = this.state()
-      const result = composePolicies(options.base, { promo: state.promoEnabled ? state.promo : null, codex: state.codexPreferred }, options.builtin, this.now())
+      const result = composePolicies(options.base, this.settings(state, state.switchProfile === null ? undefined : parseJsonc(options.base)), options.builtin, this.now())
       // Every session recomposes on each reload; an unchanged result writes nothing.
       if (disk === result.text && state.pending === undefined && state.configPath === options.path
         && isDeepStrictEqual(state.receipt, result.receipt)) return result.text
@@ -183,10 +218,26 @@ export class RoutingPolicies {
     })
   }
 
-  set(name: "promo" | "codex", on: boolean): void {
+  setPromo(on: boolean): void {
     this.locked(() => {
       const state = this.state()
-      this.persist({ ...state, ...(name === "promo" ? { promoEnabled: on } : { codexPreferred: on }) })
+      this.persist({ ...state, promoEnabled: on })
+    })
+  }
+
+  setSwitchProfile(name: string | null): void {
+    this.locked(() => {
+      this.persist({ ...this.state(), switchProfile: name })
+    })
+  }
+
+  exclude(keys: readonly string[]): void {
+    this.locked(() => {
+      const state = this.state()
+      if (this.switching() === null || !state.codex?.alert) return
+      const alert = state.codex.alert.at
+      const previous = state.switchExclude?.alert === alert ? state.switchExclude.keys : []
+      this.persist({ ...state, switchExclude: { alert, keys: [...new Set([...previous, ...keys])] } })
     })
   }
 
@@ -217,7 +268,7 @@ export class RoutingPolicies {
 
   status(): string | undefined {
     const state = this.state()
-    return signalStatus(state.promo, state.codex, state.codexPreferred, this.now())
+    return signalStatus(state.promo, state.codex, this.switching(), this.now())
   }
 
   details(): string {
@@ -234,12 +285,12 @@ export class RoutingPolicies {
       if (alert?.kind === "reset") lines.push(`Tibo 알림: 리셋 확인 ${utc(alert.at)}`)
       lines.push("출처: codex-reset.com · 개인 잔여량이 아닙니다")
     }
-    lines.push("/routing refresh · /routing promo on|off · /routing codex on|off", ...state.errors)
+    lines.push(...state.errors)
     return lines.join("\n")
   }
 
   summary(): string {
     const state = this.state()
-    return `임시 정책: 할인 ${state.promoEnabled ? "자동" : "끔"} · Codex 선호 ${state.codexPreferred ? "켬" : "끔"}`
+    return `임시 정책: 할인 ${state.promoEnabled ? "자동" : "끔"} · 리셋 공지 때 전환 ${state.switchProfile ?? "끔"}${this.switching() === null ? "" : " (전환 중)"}`
   }
 }

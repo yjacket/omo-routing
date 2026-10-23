@@ -192,32 +192,32 @@ test("both HTTP fetches use a bounded abort signal through response-body consump
 
 test("promo footer keeps discount switch and minute/hour countdown boundaries", () => {
   const promo = { fetchedAt: NOW, discountNow: 0.9, nextAt: NOW + 90 * 60_000, discountNext: 0.5 }
-  assert.deepEqual(tokens(signalStatus(promo, null, false, NOW)), ["90%", "~1h 30m"])
-  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: NOW + 59 * 60_000 }, null, false, NOW)), ["90%", "~59m"])
-  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: NOW + 25 * 3_600_000 }, null, false, NOW)), ["90%", "~25h"])
-  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: NOW + 1 }, null, false, NOW)), ["90%", "~0m"])
-  assert.deepEqual(tokens(signalStatus(promo, null, false, promo.nextAt)), ["50%"])
-  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: null }, null, false, NOW)), ["90%"])
-  assert.equal(signalStatus({ ...promo, discountNow: 0 }, null, false, NOW), undefined)
-  assert.equal(signalStatus({ ...promo, discountNext: null }, null, false, promo.nextAt), undefined)
-  assert.equal(signalStatus(null, null, false, NOW), undefined)
+  assert.deepEqual(tokens(signalStatus(promo, null, null, NOW)), ["90%", "~1h 30m"])
+  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: NOW + 59 * 60_000 }, null, null, NOW)), ["90%", "~59m"])
+  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: NOW + 25 * 3_600_000 }, null, null, NOW)), ["90%", "~25h"])
+  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: NOW + 1 }, null, null, NOW)), ["90%", "~0m"])
+  assert.deepEqual(tokens(signalStatus(promo, null, null, promo.nextAt)), ["50%"])
+  assert.deepEqual(tokens(signalStatus({ ...promo, nextAt: null }, null, null, NOW)), ["90%"])
+  assert.equal(signalStatus({ ...promo, discountNow: 0 }, null, null, NOW), undefined)
+  assert.equal(signalStatus({ ...promo, discountNext: null }, null, null, promo.nextAt), undefined)
+  assert.equal(signalStatus(null, null, null, NOW), undefined)
 })
 
 test("compact Codex footer shows only Tibo alerts: an active watch countdown or a reset within a day", async () => {
   const signal = await fetchCodexSignal(async () => response(forecast()))
-  assert.equal(signalStatus(null, signal, false, NOW), undefined)
-  assert.equal(signalStatus(null, null, true, NOW), "Codex 우선")
+  assert.equal(signalStatus(null, signal, null, NOW), undefined)
+  assert.equal(signalStatus(null, null, "work", NOW), "Codex 전환 → work")
   const watch = { ...signal, alert: { kind: "watch", state: "active", at: ISO, score: 93, endsAt: new Date(NOW + 90 * 60_000).toISOString() } }
-  assert.deepEqual(tokens(signalStatus(null, watch, false, NOW)), ["93%", "~1h 30m"])
-  assert.match(signalStatus(null, watch, true, NOW), /^Codex 우선 · /)
-  assert.equal(signalStatus(null, { ...watch, alert: { ...watch.alert, state: "expired" } }, false, NOW), undefined)
-  assert.notEqual(signalStatus(null, watch, false, NOW), signalStatus(null, { ...watch, updated_at: new Date(NOW - 300_001).toISOString() }, false, NOW))
+  assert.deepEqual(tokens(signalStatus(null, watch, null, NOW)), ["93%", "~1h 30m"])
+  assert.match(signalStatus(null, watch, "work", NOW), /^Codex 리셋 임박 93% ~1h 30m → work$/)
+  assert.equal(signalStatus(null, { ...watch, alert: { ...watch.alert, state: "expired" } }, null, NOW), undefined)
+  assert.notEqual(signalStatus(null, watch, null, NOW), signalStatus(null, { ...watch, updated_at: new Date(NOW - 300_001).toISOString() }, null, NOW))
   const reset = { ...signal, alert: { kind: "reset", state: "confirmed", at: new Date(NOW - 2 * 3_600_000).toISOString(), score: null, endsAt: null } }
-  assert.match(signalStatus(null, reset, false, NOW), /리셋됨 2h 0m 전/)
-  assert.equal(signalStatus(null, { ...reset, alert: { ...reset.alert, at: new Date(NOW - 24 * 3_600_000).toISOString() } }, false, NOW), undefined)
+  assert.match(signalStatus(null, reset, null, NOW), /리셋됨 2h 0m 전/)
+  assert.equal(signalStatus(null, { ...reset, alert: { ...reset.alert, at: new Date(NOW - 24 * 3_600_000).toISOString() } }, null, NOW), undefined)
   const promo = { fetchedAt: NOW, discountNow: 0.9, nextAt: null, discountNext: null }
-  assert.notEqual(signalStatus(promo, null, false, NOW), signalStatus({ ...promo, fetchedAt: NOW - 300_001 }, null, false, NOW))
-  assert.deepEqual(tokens(signalStatus(promo, watch, false, NOW)), ["90%", "93%", "~1h 30m"])
+  assert.notEqual(signalStatus(promo, null, null, NOW), signalStatus({ ...promo, fetchedAt: NOW - 300_001 }, null, null, NOW))
+  assert.deepEqual(tokens(signalStatus(promo, watch, null, NOW)), ["90%", "93%", "~1h 30m"])
 })
 
 test("hidden messages emit once per window, reemit after compaction and retract once", () => {

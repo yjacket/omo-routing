@@ -9,7 +9,12 @@ import {
 } from "./routing.ts"
 
 export type { PromoSchedule }
-export type PolicySettings = { readonly promo: PromoSchedule | null; readonly codex: boolean }
+export type PolicySettings = {
+  readonly promo: PromoSchedule | null
+  readonly overlay: { readonly profile: string; readonly exclude: readonly string[] } | null
+}
+export const overlayKey = (profile: string | undefined, section: string, name: string): string =>
+  `${profile ?? ""}\u0000${section}\u0000${name}`
 type PolicyChange = {
   readonly path: readonly string[]
   /** Exact JSONC values; null means the member did not exist. */
@@ -19,7 +24,6 @@ type PolicyChange = {
 export type PolicyReceipt = { readonly version: 1; readonly changes: readonly PolicyChange[] }
 
 const PROMO = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast:low"
-const CODEX = new Set(["chatgpt-subscription", "openai-codex"])
 const RESERVED = new Set(["__proto__", "constructor", "prototype"])
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -27,6 +31,10 @@ const at = (value: unknown, path: readonly string[]): unknown =>
   path.reduce<unknown>((current, key) => object(current) && Object.hasOwn(current, key) ? current[key] : undefined, value)
 const nodeAt = (node: JsoncNode | undefined, path: readonly string[]): JsoncNode | undefined =>
   path.reduce<JsoncNode | undefined>((current, key) => current?.members?.find(member => member.key === key)?.value, node)
+const harnessOf = (layer: unknown): string | undefined =>
+  object(layer) && Object.hasOwn(layer, "[native]") ? "[native]"
+    : object(at(layer, ["[senpi]"])) ? "[senpi]"
+      : ["categories", "agents", "model_profiles"].some(key => object(at(layer, [key]))) ? undefined : "[native]"
 
 export function emptyPolicyReceipt(): PolicyReceipt { return { version: 1, changes: [] } }
 
@@ -82,16 +90,26 @@ export function unwrapPolicies(text: string, receipt: PolicyReceipt | undefined)
  * The four arguments are the integration API, with an injectable clock.
  */
 export function composePolicies(baseText: string, settings: PolicySettings, builtin: BuiltinRouting, now = Date.now()): {
-  text: string; receipt: PolicyReceipt; promoActive: boolean; codexActive: boolean
+  text: string; receipt: PolicyReceipt; promoActive: boolean; overlayActive: boolean
 } {
   const promo = settings.promo
   const promoActive = promo !== null && Number.isFinite(now) && Number.isFinite(promo.fetchedAt)
     && promo.fetchedAt <= now && promo.discountNow >= 0.9 && promo.discountNow <= 1
     && promo.nextAt !== null && Number.isFinite(promo.nextAt) && now < promo.nextAt
     && ((promo.discountNext ?? 0) >= 0.9 || now < promo.nextAt - 15 * 60_000)
-  if (!promoActive && !settings.codex)
-    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, codexActive: false }
+  if (!promoActive && settings.overlay === null)
+    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, overlayActive: false }
   const raw: unknown = parseJsonc(baseText)
+  const overlay = settings.overlay && !RESERVED.has(settings.overlay.profile)
+    && object(at(raw, ["profiles", settings.overlay.profile])) ? settings.overlay : null
+  const overlayActive = overlay !== null
+  if (!promoActive && !overlayActive)
+    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, overlayActive }
+  const overlayConfig = overlay ? applyProfile(raw, overlay.profile).config : undefined
+  const overlayResolved = overlayConfig ? resolveRouting(overlayConfig, builtin) : undefined
+  const overlayLayer = overlay ? at(raw, ["profiles", overlay.profile]) : undefined
+  const overlayHarness = harnessOf(overlayLayer)
+  const overlayOwn = overlayHarness ? at(overlayLayer, [overlayHarness]) : overlayLayer
   const profiles = [undefined, ...profileNames(raw).filter(name => !RESERVED.has(name) && object(at(raw, ["profiles", name])))]
   const layers = profiles.map(profile => {
     const config: Record<string, unknown> = applyProfile(raw, profile).config
@@ -127,35 +145,31 @@ export function composePolicies(baseText: string, settings: PolicySettings, buil
   for (const { profile, config, resolved } of layers) {
     const prefix = profile === undefined ? [] : ["profiles", profile]
     const layer = at(raw, prefix)
-    const harness = object(layer) && Object.hasOwn(layer, "[native]") ? "[native]"
-      : object(at(layer, ["[senpi]"])) ? "[senpi]"
-        : ["categories", "agents", "model_profiles"].some(key => object(at(layer, [key]))) ? undefined : "[native]"
+    const harness = harnessOf(layer)
     const target = [...prefix, ...(harness ? [harness] : [])]
     for (const section of ["categories", "agents"] as const) {
       const names = new Set(Object.keys(resolved.config[section]))
+      if (overlayActive) for (const name of Object.keys(object(at(overlayOwn, [section])) ? at(overlayOwn, [section]) as Record<string, unknown> : {})) names.add(name)
       if (promoActive) for (const name of section === "categories" ? ["quick"] : ["explore", "librarian"]) names.add(name)
       for (const name of names) {
         if (RESERVED.has(name) || resolved.sources[section][name] === "disabled") continue
-        const chain: string[] = resolved.config[section][name]?.models ?? []
+        const ownChain: string[] = resolved.config[section][name]?.models ?? []
+        const overlaid = overlay !== null && overlayResolved !== undefined && profile !== overlay.profile
+          && !overlay.exclude.includes(overlayKey(profile, section, name))
+          && object(at(overlayOwn, [section])) && Object.hasOwn(at(overlayOwn, [section]) as object, name)
+          && overlayResolved.sources[section][name] !== "disabled"
+        const chain: string[] = overlaid ? overlayResolved.config[section][name]?.models ?? [] : ownChain
         const promotional = promoActive && (section === "categories" ? name === "quick" : name === "explore" || name === "librarian")
-        const codex = (spec: string): boolean => splitSpec(spec)?.providers.some(provider => CODEX.has(provider)) ?? false
-        const preferCodex = (spec: string): string => {
-          const parsed = splitSpec(spec)
-          if (!parsed || parsed.providers.length < 2) return spec
-          const providers = [...parsed.providers.filter(provider => CODEX.has(provider)), ...parsed.providers.filter(provider => !CODEX.has(provider))]
-          return `{${providers.join("|")}}${spec.slice(spec.indexOf("/"))}`
-        }
-        const reordered = promotional ? [PROMO, ...chain]
-          : settings.codex ? [...chain.filter(codex), ...chain.filter(spec => !codex(spec))].map(preferCodex) : chain
+        const reordered = promotional ? [PROMO, ...chain] : chain
         // A chain the policy rewrites is pinned into the config: drop the exact
         // repeats OMO's builtin resolution yields (primary, then fallbacks led by it).
-        const wanted = isDeepStrictEqual(reordered, chain) ? chain : [...new Set(reordered)]
+        const wanted = isDeepStrictEqual(reordered, ownChain) ? ownChain : [...new Set(reordered)]
         const current = resolveRouting(applyProfile(parseJsonc(text), profile).config, builtin)
         const actual: string[] = current.config[section][name]?.models ?? []
         if (isDeepStrictEqual(actual, wanted)) continue
         // Reuse configured object rungs (including their metadata). Only builtin
         // or string agent rungs need encoding into OMO's model/variant format.
-        const entry = at(config, [section, name])
+        const entry = at(overlaid ? overlayConfig : config, [section, name])
         const models = at(entry, ["models"])
         const fallbacks = at(entry, ["fallback_models"])
         const existing = [at(entry, ["model"]), ...(Array.isArray(models) ? models : []),
@@ -175,5 +189,5 @@ export function composePolicies(baseText: string, settings: PolicySettings, buil
       }
     }
   }
-  return { text, receipt: { version: 1, changes }, promoActive, codexActive: settings.codex }
+  return { text, receipt: { version: 1, changes }, promoActive, overlayActive }
 }

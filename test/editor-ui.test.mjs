@@ -293,6 +293,82 @@ test("p opens the profile menu: save-new first, then the existing profiles; Esc 
   assert.deepEqual(editor.pending(), [])
 })
 
+test("the profile menu policy rows show live values, skip headers and signals, and invalidate the preview on changes", () => {
+  let promo = true
+  let switchProfile = null
+  let previews = 0
+  const changes = []
+  const { editor } = makeEditor({
+    policies: {
+      view: () => ({
+        promo, switchProfile, switching: switchProfile !== null,
+        summary: `할인 ${promo ? "자동" : "끔"}`,
+        lines: ["Codex 리셋 임박 93%", "신호 상태"],
+      }),
+      setPromo: on => { promo = on; changes.push(on) },
+      setSwitchProfile: name => { switchProfile = name; changes.push(name) },
+    },
+    policyConfig: raw => { previews++; return raw },
+  })
+  const height = editor.render(140).length
+  press(editor, "p")
+  assert.match(screen(editor), /^정책$/m)
+  assert.match(screen(editor), /^  DeepSeek 할인 자동 · 켬$/m)
+  assert.match(screen(editor), /^  리셋 공지 때 전환 · 끔$/m)
+  assert.match(screen(editor), /^Codex 리셋 임박 93%$/m)
+  press(editor, "\x1b[F")
+  assert.match(screen(editor), /^▸ 리셋 공지 때 전환 · 끔$/m)
+  press(editor, KEY.down)
+  assert.match(screen(editor), /^▸ 리셋 공지 때 전환 · 끔$/m, "signals are not selectable")
+  for (const name of ["work", "legacy", "both", null]) {
+    press(editor, KEY.enter)
+    assert.equal(switchProfile, name)
+    assert.match(screen(editor), new RegExp(`^▸ 리셋 공지 때 전환 · ${name ?? "끔"}${name ? " · 전환 중" : ""}$`, "m"))
+    assert.equal(editor.render(140).length, height)
+  }
+  press(editor, KEY.up, KEY.enter)
+  assert.equal(promo, false)
+  assert.match(screen(editor), /^▸ DeepSeek 할인 자동 · 끔$/m)
+  press(editor, "\x1b[H")
+  assert.match(screen(editor), /^▸ \+ 새 프로필 저장$/m)
+  press(editor, "\x1b[6~")
+  assert.match(screen(editor), /^▸ 리셋 공지 때 전환 · 끔$/m)
+  press(editor, "\x1b[5~")
+  assert.match(screen(editor), /^▸ \+ 새 프로필 저장$/m)
+  assert.deepEqual(changes, ["work", "legacy", "both", null, false])
+  assert.equal(previews, 6, "each policy change recomputes the effective node preview")
+})
+
+test("policy menu rows fit styled and narrow viewports without changing the reserved height", () => {
+  const theme = { fg: (_color, text) => `\x1b[32m${text}\x1b[0m`, bold: text => `\x1b[1m${text}\x1b[22m` }
+  for (const styled of [undefined, theme]) {
+    for (const width of [19, 24, 40, 80, 140]) {
+      const { editor } = makeEditor({
+        theme: styled, rows: () => 24,
+        policies: {
+          view: () => ({ promo: true, switchProfile: "work", switching: true, summary: "임시 정책", lines: ["Codex 리셋 예측: 24h 90% · 48h 95%", "신호 오류 상세 ".repeat(10)] }),
+          setPromo() {}, setSwitchProfile() {},
+        },
+      })
+      const height = editor.render(width).length
+      press(editor, "p", "\x1b[F")
+      const lines = editor.render(width)
+      assert.equal(lines.length, height)
+      assert.ok(lines.length <= 19)
+      for (const line of lines) assert.equal(cells(line), width)
+    }
+  }
+  const { editor } = makeEditor({
+    raw: {},
+    policies: {
+      view: () => ({ promo: true, switchProfile: null, switching: false, summary: "", lines: [] }),
+      setPromo() {}, setSwitchProfile: name => assert.equal(name, null),
+    },
+  })
+  press(editor, "p", "\x1b[F", KEY.enter)
+  assert.match(screen(editor), /^▸ 리셋 공지 때 전환 · 끔$/m)
+})
+
 test("the profile menu tells the edited profile from the active one; the apply confirmation names the target and defaults to apply only while nothing is staged", () => {
   const chosen = []
   const { editor, closed } = makeEditor({ profile: "work", active: "legacy", selectProfile: name => { chosen.push(name) } })

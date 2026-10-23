@@ -187,7 +187,7 @@ function codexStatus(codex: CodexSignal | null, now: number): string | undefined
 export function signalStatus(
   promo: PromoSchedule | null,
   codex: CodexSignal | null,
-  codexPreferred: boolean,
+  switching: string | null,
   now = Date.now(),
 ): string | undefined {
   const parts: string[] = []
@@ -202,8 +202,8 @@ export function signalStatus(
     }
   }
   const codexText = codexStatus(codex, now)
-  if (codexPreferred) parts.push(codexText ? `Codex 우선 · ${codexText}` : "Codex 우선")
-  else if (codexText) parts.push(`Codex ${codexText}`)
+  if (codexText || switching !== null)
+    parts.push(`Codex ${codexText ?? "전환"}${switching === null ? "" : ` → ${switching}`}`)
   return parts.length ? parts.join(" | ") : undefined
 }
 

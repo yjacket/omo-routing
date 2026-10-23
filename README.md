@@ -14,11 +14,9 @@ of providers the running session is not connected to; it reads no credentials.
 /routing             the current profile's layer, base one Tab away (base alone when no profile is set)
 /routing -p <name>   that profile's layer (also --profile <name>)
 /routing --base      base alone, no profile overlay
-/routing policy      current temporary policies, public signals and their source
-/routing refresh     fetch signals (one-minute cache) and recompose current chains
-/routing promo on|off  enable/disable the automatic OpenGateway discount policy
-/routing codex on|off  manually prefer existing Codex candidates in task chains
 ```
+
+Temporary policies are controlled from the editor's `p` menu only.
 
 ### Temporary policies
 
@@ -33,18 +31,25 @@ profile does not hide the discount.
 - **OpenGateway**: enabled by default. At 90% off or more, DeepSeek
   `deepseek-v4.1-flash-ultrafast` leads quick/explore/librarian, stopping 15 minutes
   before a known discount end. Expired cached schedules cannot enable it.
-- **Codex**: off by default and enabled only by `/routing codex on`, never by a
-  forecast or a reset event. Existing `chatgpt-subscription`/`openai-codex`
-  candidates move first in task category/agent chains without adding models.
-  The DeepSeek promotion takes precedence on its three lanes. Disabled nodes
-  and the main-session model are not changed.
+- **Reset-notice profile switch** (`리셋 공지 때 전환`): off by default. Pick a
+  saved profile for it in the `p` menu, for example a `codex` profile you made
+  with `+ 새 프로필 저장`. While Codex Reset shows an active Tibo Watch that
+  hasn't passed its deadline, every category and agent that profile's own layer
+  defines takes the chain the profile resolves to, in base and in every other
+  profile. The DeepSeek promotion still leads its three lanes. The switch ends
+  by itself when the Watch closes, at the next recomposition. A chain you save
+  in the editor during a switch is left out of it for that layer until the
+  Watch ends, so your edit applies right away. Disabled nodes and the
+  main-session model aren't changed.
 
 Session start and a one-minute timer collect OpenGateway prices and the public
 Codex Reset forecast. The compact `omo-routing` footer retains the discount
 countdown and shows only Codex Reset's Tibo-based alert: an active ⚠️ Watch
 (Tibo hinted at a reset) with its score and the time to its deadline, or a ✅
-reset confirmed within the last 24 hours. `/routing policy` adds the 24- and
-48-hour forecast, confidence, last reset, the alert, source and fetch errors. Codex Reset
+reset confirmed within the last 24 hours. While the switch is active the Codex
+part ends with ` → <profile>`, e.g. `Codex 리셋 임박 93% ~3h 20m → codex`. The
+`p` menu's 정책 section adds the 24- and 48-hour forecast, confidence, last
+reset, the alert, source and fetch errors. Codex Reset
 is a prediction/public-event source, **not personal remaining usage**.
 The GET contract is documented at https://codex-reset.com/developers/.
 Readers identify as `omo-routing/0.1 (+https://github.com/yjacket/omo-routing)`.
@@ -56,7 +61,7 @@ by a cross-session lock and an external-change check. A busy lock is waited on
 for up to 2 seconds; one left behind by a crashed session is cleared after 30
 seconds. Do not delete the receipt
 while policies are applied. Signal failures keep the previous cache and are
-shown by `/routing policy`; manual refresh also honours the one-minute limit.
+shown in the `p` menu; refreshing also honours the one-minute limit.
 Refresh writes are deferred while the editor has unsaved work. The policy
 reconciles on save or close.
 
@@ -118,7 +123,7 @@ picked (removing, reordering and effort changes still work).
 | View | Keys (also shown in the footer) |
 | --- | --- |
 | list | ↑↓ PgUp PgDn Home End move · Enter/→ open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `p` profile menu · `s` save · `q`/Esc close |
-| profile menu | ↑↓ PgUp PgDn Home End · Enter/→ on `+ 새 프로필 저장` enters a name, on a profile asks to apply it · Esc/←/`q`/`p` back |
+| profile menu | ↑↓ PgUp PgDn Home End · Enter/→ on `+ 새 프로필 저장` enters a name, on a profile asks to apply it, on `DeepSeek 할인 자동` toggles it, on `리셋 공지 때 전환` cycles off → each profile → off · Esc/←/`q`/`p` back |
 | apply confirmation | ↑↓ Home End pick cancel or apply · Enter confirm · Esc/←/`q` back to the menu |
 | profile name | type the name · Backspace · Enter save · Esc back to the menu |
 | chain | ↑↓ move · `a` add after the cursor (Enter on `+ 모델 추가` too) · Enter replace the model · `e` effort · `d`/Delete/Backspace remove · `K`/`J` or Shift+↑/↓ move · `b` copy the builtin chain · `r` follow · `x` disable · `h` hidden · `u` undo · `s` save · Esc/←/`q` back |
@@ -184,8 +189,12 @@ hot reload turned off, `/reload` applies them. The closing notice says so.
 ### Saving as a new profile
 
 `p` opens the profile menu: `+ 새 프로필 저장` (save as a new profile) first,
-then the existing profiles. Enter on the first row asks for a name; Enter on an
-existing profile asks whether to apply it (see below). The name is
+then the existing profiles, then a `정책` (policies) section: `DeepSeek 할인
+자동 · 켬|끔` and `리셋 공지 때 전환 · 끔|<profile>` (with ` · 전환 중` while
+switching), followed by dim signal lines (status, forecast, freshness and
+errors). Enter on the first row asks for a name; Enter on an existing profile
+asks whether to apply it (see below); Enter on a policy row changes it at once.
+The name is
 trimmed and must be new (an exact key match counts as taken), nonempty, free
 of whitespace, control characters, `/` and `\`, and not a reserved key such as
 `__proto__` or `[native]`. A `profiles` value that isn't an object is refused.
