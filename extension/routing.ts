@@ -162,7 +162,9 @@ const errorText = (error: unknown): string => error instanceof Error ? error.mes
 // @babel/parser that omo-ai itself installs, so JS syntax (`!0`, spreads, quoting,
 // field order) is read by a JS parser, not a hand-written tokenizer. Tables are
 // recognized by AST shape, never by minifier names or category names, and only
-// constant data is evaluated.
+// constant data is evaluated. Since 5.1.48 the tables reach that data through
+// names (`model:oa.geminiPro`, `model:Rb`, `providers:[...tae]`), which are
+// resolved to the constant data the same bundle binds them to.
 
 type AstNode = { type: string; start: number; end: number; [key: string]: any }
 type Bundle = {
@@ -172,8 +174,11 @@ type Bundle = {
   profileTables: AstNode[]
   /** Objects with a string `name`: category and agent definitions among others. */
   definitions: AstNode[]
-  /** `name=[...]` array literals (declarations or assignments): spread sources. */
-  arrays: Map<string, AstNode[]>
+  /** Every value bound to `name` by a declaration or a plain `name=` assignment. */
+  bindings: Map<string, AstNode[]>
+  /** Names changed after binding: compound or member assignment, ++/--, delete,
+   * destructuring, for-in/of, or handed to a call that could mutate them. */
+  mutated: Set<string>
   context: Record<string, unknown>
 }
 
@@ -198,54 +203,87 @@ const isProfile = (node: AstNode): boolean => node.type === "ObjectExpression" &
 const isAgentTable = (node: AstNode): boolean => ["explore", "librarian"].every(name => keysOf(node).includes(name))
 
 const CONSTANT_UNARY = new Set(["!", "-", "+", "~", "void"])
+const CONSTANT_GLOBALS = new Set(["undefined", "NaN", "Infinity"])
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
+/** The root name of a plain reference: `name`, `name.key`, `name["key"]`,
+ * `name.key[0]`; undefined for anything else (calls, `this`, computed keys). */
+function referenceRoot(node: AstNode): string | undefined {
+  if (node.type === "Identifier") return node.name
+  if (node.type !== "MemberExpression") return undefined
+  const key = !node.computed && node.property.type === "Identifier" ? node.property.name
+    : node.computed && (node.property.type === "StringLiteral" || node.property.type === "NumericLiteral") ? String(node.property.value)
+      : undefined
+  return key === undefined || UNSAFE_KEYS.has(key) ? undefined : referenceRoot(node.object)
+}
+
 /** Constant data only: literals, operators over constants, arrays, plain
- * objects, and array spreads of a named array (collected into `spreads`).
- * Calls, functions, member access and every other reference are rejected
- * before anything is evaluated. */
-function isConstant(node: AstNode | null, spreads: Set<string>): boolean {
+ * objects, and references (a name, member reads of it, array spreads of it)
+ * whose roots are collected into `refs` (name -> how it was used, for errors)
+ * and must themselves resolve to constant data. Calls, functions and every
+ * other expression are rejected before anything is evaluated. */
+function isConstant(node: AstNode | null, refs: Map<string, string>): boolean {
   if (node === null) return true // array hole
   switch (node.type) {
+    case "Identifier":
+      if (!CONSTANT_GLOBALS.has(node.name) && !refs.has(node.name)) refs.set(node.name, node.name)
+      return true
+    case "MemberExpression": {
+      const root = referenceRoot(node)
+      if (root === undefined) return false
+      if (!refs.has(root)) refs.set(root, root)
+      return true
+    }
     case "StringLiteral": case "NumericLiteral": case "BooleanLiteral": case "NullLiteral": case "BigIntLiteral":
       return true
     case "TemplateLiteral":
-      return node.expressions.every((expression: AstNode) => isConstant(expression, spreads))
+      return node.expressions.every((expression: AstNode) => isConstant(expression, refs))
     case "UnaryExpression":
-      return CONSTANT_UNARY.has(node.operator) && isConstant(node.argument, spreads)
+      return CONSTANT_UNARY.has(node.operator) && isConstant(node.argument, refs)
     case "BinaryExpression":
-      return node.operator !== "in" && node.operator !== "instanceof" && isConstant(node.left, spreads) && isConstant(node.right, spreads)
+      return node.operator !== "in" && node.operator !== "instanceof" && isConstant(node.left, refs) && isConstant(node.right, refs)
     case "LogicalExpression":
-      return isConstant(node.left, spreads) && isConstant(node.right, spreads)
+      return isConstant(node.left, refs) && isConstant(node.right, refs)
     case "ConditionalExpression":
-      return [node.test, node.consequent, node.alternate].every(part => isConstant(part, spreads))
+      return [node.test, node.consequent, node.alternate].every(part => isConstant(part, refs))
     case "ArrayExpression":
       return node.elements.every((element: AstNode | null) => {
-        if (element?.type !== "SpreadElement") return isConstant(element, spreads)
-        if (element.argument.type !== "Identifier") return false
-        spreads.add(element.argument.name)
+        if (element?.type !== "SpreadElement") return isConstant(element, refs)
+        const root = referenceRoot(element.argument)
+        if (root === undefined) return false
+        refs.set(root, `...${root}`)
         return true
       })
     case "ObjectExpression":
-      return node.properties.every((property: AstNode) => keyOf(property) !== undefined && isConstant(property.value, spreads))
+      return node.properties.every((property: AstNode) => keyOf(property) !== undefined && isConstant(property.value, refs))
     default:
       return false
   }
 }
 
-/** The value of a constant-data node. A spread `...name` reads the array literal
- * bound to `name` in the same bundle; minifiers reuse short names across scopes,
- * so every such literal must be the same array, and none or several different
- * ones are unsupported rather than guessed. */
-function evaluate(bundle: Bundle, node: AstNode, spreadDepth = 2): unknown {
-  const spreads = new Set<string>()
-  if (!isConstant(node, spreads))
+/** The value of a constant-data node. A referenced name reads the constant data
+ * bound to it in the same bundle; minifiers reuse short names across scopes, so
+ * every binding of the name must be constant data with the same value, and the
+ * name must never be changed after binding. No binding, a non-constant one,
+ * differing ones or a mutation are unsupported rather than guessed. */
+function evaluate(bundle: Bundle, node: AstNode, depth = 3): unknown {
+  const refs = new Map<string, string>()
+  if (!isConstant(node, refs))
     throw new UnsupportedBundle(`${bundle.file}: non-constant expression in builtin data at offset ${node.start}`)
-  for (const name of spreads) {
-    const definitions = bundle.arrays.get(name) ?? []
-    if (!definitions.length) throw new UnsupportedBundle(`${bundle.file}: no array literal defines ...${name}`)
-    if (spreadDepth === 0) throw new UnsupportedBundle(`${bundle.file}: ...${name} is nested too deeply`)
-    const values = new Set(definitions.map(definition => JSON.stringify(evaluate(bundle, definition, spreadDepth - 1))))
-    if (values.size !== 1) throw new UnsupportedBundle(`${bundle.file}: conflicting array literals define ...${name}`)
-    bundle.context[name] = JSON.parse([...values][0])
+  for (const [name, use] of refs) {
+    if (Object.hasOwn(bundle.context, name)) continue
+    const definitions = bundle.bindings.get(name) ?? []
+    if (!definitions.length) throw new UnsupportedBundle(`${bundle.file}: no constant data defines ${use}`)
+    if (bundle.mutated.has(name)) throw new UnsupportedBundle(`${bundle.file}: ${use} is changed after it is defined`)
+    if (depth === 0) throw new UnsupportedBundle(`${bundle.file}: ${use} is nested too deeply`)
+    const values = new Set(definitions.map(definition => {
+      if (!isConstant(definition, new Map()))
+        throw new UnsupportedBundle(`${bundle.file}: ${use} is bound to non-constant data at offset ${definition.start}`)
+      return JSON.stringify(evaluate(bundle, definition, depth - 1)) ?? "undefined"
+    }))
+    if (values.size !== 1) throw new UnsupportedBundle(`${bundle.file}: conflicting definitions of ${use}`)
+    const [value] = values
+    bundle.context[name] = value === "undefined" ? undefined : JSON.parse(value)
   }
   // Constant data cannot run code; the VM only supplies JS semantics, and the
   // result is copied out of its realm.
@@ -261,7 +299,7 @@ function evaluate(bundle: Bundle, node: AstNode, spreadDepth = 2): unknown {
 /** A constant string property, or undefined when absent or not constant data. */
 function textOf(bundle: Bundle, node: AstNode, key: string): string | undefined {
   const value = propertyOf(node, key)
-  if (value === undefined || !isConstant(value, new Set())) return undefined
+  if (value === undefined || !isConstant(value, new Map())) return undefined
   const text = evaluate(bundle, value)
   return typeof text === "string" ? text : undefined
 }
@@ -274,16 +312,34 @@ function parseBundle(file: string, source: string, parse: (source: string) => As
     return new UnsupportedBundle(`cannot parse ${file}: ${errorText(error)}`)
   }
   const bundle: Bundle = {
-    file, source, chainTables: [], profileTables: [], definitions: [], arrays: new Map(),
+    file, source, chainTables: [], profileTables: [], definitions: [], bindings: new Map(), mutated: new Set(),
     context: createContext(Object.create(null)),
+  }
+  const mutate = (target: AstNode | null | undefined): void => {
+    if (!target) return
+    const root = target.type === "MemberExpression" ? memberRoot(target) : target.type === "Identifier" ? target.name : undefined
+    if (root !== undefined) bundle.mutated.add(root)
+    else for (const name of patternNames(target)) bundle.mutated.add(name)
   }
   const stack = [program]
   while (stack.length) {
     const node = stack.pop() as AstNode
-    const [target, value] = node.type === "VariableDeclarator" ? [node.id, node.init]
-      : node.type === "AssignmentExpression" && node.operator === "=" ? [node.left, node.right] : []
-    if (target?.type === "Identifier" && value?.type === "ArrayExpression")
-      bundle.arrays.set(target.name, [...(bundle.arrays.get(target.name) ?? []), value])
+    if (node.type === "VariableDeclarator") {
+      if (node.id.type === "Identifier") {
+        if (node.init) bundle.bindings.set(node.id.name, [...(bundle.bindings.get(node.id.name) ?? []), node.init])
+      } else mutate(node.id)
+    } else if (node.type === "AssignmentExpression") {
+      if (node.operator === "=" && node.left.type === "Identifier")
+        bundle.bindings.set(node.left.name, [...(bundle.bindings.get(node.left.name) ?? []), node.right])
+      else mutate(node.left)
+    } else if (node.type === "UpdateExpression" || (node.type === "UnaryExpression" && node.operator === "delete")) mutate(node.argument)
+    else if (node.type === "ForInStatement" || node.type === "ForOfStatement") {
+      if (node.left.type !== "VariableDeclaration") mutate(node.left)
+    } else if (node.type === "CallExpression" || node.type === "NewExpression" || node.type === "OptionalCallExpression") {
+      for (const argument of node.arguments) mutate(argument.type === "SpreadElement" ? argument.argument : argument)
+      // `name.method(...)` may change name in place (push, splice, sort...).
+      if (node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression") mutate(node.callee.object)
+    }
     if (node.type === "ObjectExpression") {
       if (isTableOf(node, isChain)) bundle.chainTables.push(node)
       else if (isTableOf(node, isProfile)) bundle.profileTables.push(node)
@@ -294,6 +350,26 @@ function parseBundle(file: string, source: string, parse: (source: string) => As
         if (item !== null && typeof item === "object" && typeof item.type === "string") stack.push(item)
   }
   return bundle
+}
+
+/** The name a member chain is read from (`a` in `a.b[c].d`), if any. */
+function memberRoot(node: AstNode): string | undefined {
+  while (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") node = node.object
+  return node.type === "Identifier" ? node.name : undefined
+}
+
+/** Every name a destructuring pattern assigns. */
+function patternNames(node: AstNode | null): string[] {
+  if (!node) return []
+  switch (node.type) {
+    case "Identifier": return [node.name]
+    case "MemberExpression": { const root = memberRoot(node); return root === undefined ? [] : [root] }
+    case "ArrayPattern": return node.elements.flatMap(patternNames)
+    case "ObjectPattern": return node.properties.flatMap((property: AstNode) => patternNames(property.type === "RestElement" ? property : property.value))
+    case "RestElement": return patternNames(node.argument)
+    case "AssignmentPattern": return patternNames(node.left)
+    default: return []
+  }
 }
 
 /** The one table of a kind; none or several are unsupported, never chosen by file order. */
