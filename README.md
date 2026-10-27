@@ -286,12 +286,16 @@ a JS parser reads the minified syntax (`!0`, `void 0`, spreads, quoting), not
 a hand-written tokenizer. Tables are recognized by their AST shape, not by
 minified variable names, field order or category names. Only constant data is
 evaluated — literals, operators over them, arrays and plain objects — in a
-separate `vm` context; calls, functions and any other reference are rejected
-before evaluation. The bundles are never imported or run, and no model list is
-copied into this extension. A shared provider list spread into a rung
-(`providers:[...a8]`) is read from its array literal `a8=[...]` in the same
-bundle; a spread with no such literal, or with conflicting ones, is
-unsupported. The result is cached until the bundle contents change. Missing
+separate `vm` context; calls, functions and computed or prototype member reads
+are rejected before evaluation. The bundles are never imported or run, and no
+model list is copied into this extension. A name the data refers to — a shared
+provider list spread into a rung (`providers:[...a8]`), a model bound to a name
+(`model:Rb`) or read from a constant object (`model:oa.geminiPro`, OMO 5.1.48)
+— is read from what the same bundle binds it to (`a8=[...]`, `Rb="..."`,
+`oa={...}`). Every binding of that name must be constant data with the same
+value, and the name must never be changed afterwards (member or compound
+assignment, `++`, `delete`, destructuring, passed to a call); otherwise the
+section is unsupported rather than guessed. The result is cached until the bundle contents change. Missing
 files, a missing parser, unsupported expressions, or ambiguous tables produce
 a visible warning for the affected section. Restart/reload the host after
 upgrading OMO so the source on disk and the running host agree.

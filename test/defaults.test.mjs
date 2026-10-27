@@ -97,6 +97,49 @@ test("a spread without exactly one literal array definition is unsupported, not 
   }
 })
 
+test("tables reach their data through names bound to constants (2026-10-27 OMO 5.1.48 bundle)", t => {
+  const h = fixture(t)
+  // Model names through a constant object assigned in a lazy initializer, a
+  // string-bound name, and comma-joined minified declarations.
+  writeFileSync(join(h.extensions, "omo-task.js"), `var m,ba=r(()=>{m={fast:"fast",smart:"smart"}});let s="search",p=["four"];var a={explore:[{providers:[...p],model:s,variant:"low"}],librarian:[{providers:["five"],model:m.smart}]};var c={quick:[{providers:["one","two"],model:m.fast,variant:"low"}],deep:[{providers:["three"],model:m["smart"],variant:"high"}]};var d=[{name:"quick",config:{model:"one/"+m.fast,variant:"low"}}];throw new Error("must never execute installed source");`)
+  writeFileSync(join(h.extensions, "omo.js"), `const tae=["six","seven"],Rb="main",Bb="alt";var q=Object.freeze({capable:{displayName:"Capable",models:[{providers:[...tae],model:Rb,variant:"medium"},{providers:[...tae,"eight"],model:Bb}]}});throw new Error("must never execute installed source");`)
+  const result = routing.loadBuiltinRouting(h.env)
+  assert.equal(result.status, "loaded", result.reason)
+  assert.deepEqual(result.defaults.unavailable, {})
+  assert.deepEqual(result.defaults.categories.quick, [{ providers: ["one", "two"], model: "fast", variant: "low" }])
+  assert.deepEqual(result.defaults.categories.deep, [{ providers: ["three"], model: "smart", variant: "high" }])
+  assert.equal(result.defaults.categoryModels.quick, "one/fast:low")
+  assert.deepEqual(result.defaults.agents.explore, [{ providers: ["four"], model: "search", variant: "low" }])
+  assert.deepEqual(result.defaults.agents.librarian, [{ providers: ["five"], model: "smart" }])
+  assert.deepEqual(result.defaults.model_profiles.capable, [
+    { providers: ["six", "seven"], model: "main", variant: "medium" },
+    { providers: ["six", "seven", "eight"], model: "alt" },
+  ])
+})
+
+test("a name whose binding is not constant data is unsupported, not guessed", t => {
+  const h = fixture(t)
+  const table = `var c={quick:[{providers:["one"],model:m.fast}]};`
+  for (const [definitions, reason] of [
+    ["", /no constant data defines m/],
+    ["var m=g();", /m is bound to non-constant data/],
+    [`var m={fast:"fast"};function f(){var m={fast:"other"}}`, /conflicting definitions of m/],
+    [`var m={fast:"fast"};m.fast=g();`, /m is changed after it is defined/],
+    [`var m={fast:"fast"};Object.assign(m,g());`, /m is changed after it is defined/],
+    [`var m={fast:"fast"};[m]=g();`, /m is changed after it is defined/],
+  ]) {
+    writeFileSync(join(h.extensions, "omo-task.js"), definitions + table)
+    const result = routing.loadBuiltinRouting(h.env)
+    assert.match(result.defaults.unavailable.categories ?? "", reason, definitions || "no definition")
+    assert.deepEqual(result.defaults.categories, {})
+  }
+  // Computed or prototype member reads are not constant references.
+  for (const model of ["m[k]", "m.constructor", "m.fast()", "this.fast"]) {
+    writeFileSync(join(h.extensions, "omo-task.js"), `var m={fast:"fast"},k="fast";var c={quick:[{providers:["one"],model:${model}}]};`)
+    assert.match(routing.loadBuiltinRouting(h.env).defaults.unavailable.categories ?? "", /non-constant expression/, model)
+  }
+})
+
 test("source discovery requires a known installed launcher and never guesses another installation", () => {
   assert.equal(routing.loadBuiltinRouting({}).status, "unavailable")
 })
