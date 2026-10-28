@@ -117,6 +117,66 @@ test("tables reach their data through names bound to constants (2026-10-27 OMO 5
   ])
 })
 
+// A launch gate shaped like OMO 5.1.51's Fable 5.5 pre-wiring, under other names:
+// chains pass through a bundle function that drops the rungs of a model not
+// released yet, and logs a released rung whose effort it does not accept.
+const gated = released => `var nx,on,rel=${released ? "!0" : "!1"},dropped=[],ini=r(()=>{nx={id:"next"},on={measured:!1,accepted:["max"]}});function isNext(e){return(e.split("/").pop()??e)===nx.id}function note(e){dropped.push(e),console.warn("dropped "+e.model)}function gate(e){return function(e,t,n){return e.filter(e=>!(isNext(e.model)&&(!t.released||(void 0===e.variant||!t.accepted.includes(e.variant))&&(n({model:e.model,variant:e.variant}),1))))}(e,{released:rel,accepted:on.accepted},note)}function primary(){return rel?nx.id:"smart"}`
+const GATED_TASK = `var a={explore:gate([{providers:["four"],model:nx.id,variant:"max"},{providers:["four"],model:"search"}]),librarian:[{providers:["five"],model:"docs"}]};var c={quick:[{providers:["one"],model:"fast"}],deep:gate([{providers:["three"],model:nx.id,variant:"max"},{providers:["three"],model:"smart",variant:"high"}])};var d=[{name:"deep",config:{model:primary(),variant:"high"}}];throw new Error("must never execute installed source");`
+const GATED_MAIN = `var q=Object.freeze({capable:{displayName:"Capable",models:gate([{providers:["six"],model:nx.id,variant:"max"},{providers:["six"],model:"main",variant:"max"}])}});throw new Error("must never execute installed source");`
+
+test("chains passed through a bundle function are what that function returns, as the host runs it (2026-10-28 OMO 5.1.51 bundle)", t => {
+  const h = fixture(t)
+  writeFileSync(join(h.extensions, "omo-task.js"), gated(false) + GATED_TASK)
+  writeFileSync(join(h.extensions, "omo.js"), gated(false) + GATED_MAIN)
+  const unreleased = routing.loadBuiltinRouting(h.env)
+  assert.equal(unreleased.status, "loaded", unreleased.reason)
+  assert.deepEqual(unreleased.defaults.unavailable, {})
+  assert.deepEqual(unreleased.defaults.categories.deep, [{ providers: ["three"], model: "smart", variant: "high" }])
+  assert.deepEqual(unreleased.defaults.categories.quick, [{ providers: ["one"], model: "fast" }])
+  assert.equal(unreleased.defaults.categoryModels.deep, "smart:high")
+  assert.deepEqual(unreleased.defaults.agents.explore, [{ providers: ["four"], model: "search" }])
+  assert.deepEqual(unreleased.defaults.model_profiles.capable, [{ providers: ["six"], model: "main", variant: "max" }])
+  // The gate's own flag decides, so the result follows it rather than a stripped wrapper.
+  writeFileSync(join(h.extensions, "omo-task.js"), gated(true) + GATED_TASK)
+  writeFileSync(join(h.extensions, "omo.js"), gated(true) + GATED_MAIN)
+  const released = routing.loadBuiltinRouting(h.env)
+  assert.deepEqual(released.defaults.unavailable, {})
+  assert.deepEqual(released.defaults.categories.deep.map(rung => rung.model), ["next", "smart"])
+  assert.equal(released.defaults.categoryModels.deep, "next:high")
+  assert.deepEqual(released.defaults.model_profiles.capable.map(rung => rung.model), ["next", "main"])
+  // A released rung the gate would log (an effort it does not accept) needs the
+  // logger and its mutated list, which are not constant data.
+  writeFileSync(join(h.extensions, "omo.js"), gated(true) + GATED_MAIN.replace('model:nx.id,variant:"max"', 'model:nx.id,variant:"low"'))
+  const logged = routing.loadBuiltinRouting(h.env)
+  assert.match(logged.defaults.unavailable.model_profiles ?? "", /(dropped|console) is not constant data/)
+  assert.deepEqual(logged.defaults.model_profiles, {})
+})
+
+test("a bundle function is run only over the bundle's constant data; anything else it reaches is unsupported, not guessed", t => {
+  const h = fixture(t)
+  const table = `var c={quick:f([{providers:["one"],model:"fast"}])};`
+  for (const [definitions, reason] of [
+    ["", /no constant data defines f\(\.\.\.\)/],
+    ["function f(e){return Date.now()?e:[]}", /Date is not constant data/],
+    ["function f(e){return e.filter(()=>Math.random()<2)}", /Math is not constant data/],
+    ["var k=[];k.push(1);function f(e){return k.length?e:[]}", /k is not constant data/],
+    ["function f(e){return e}function h(){function f(e){return[]}}", /conflicting definitions of f/],
+    ["function f(e){return e}f=g();", /f\(\.\.\.\) is bound to non-constant data/],
+    ["function f(e){return e}[f]=g();", /f\(\.\.\.\) is changed after it is defined/],
+    ["async function f(e){return e}", /not a plain function/],
+  ]) {
+    writeFileSync(join(h.extensions, "omo-task.js"), definitions + table)
+    const result = routing.loadBuiltinRouting(h.env)
+    assert.match(result.defaults.unavailable.categories ?? "", reason, definitions || "no definition")
+    assert.deepEqual(result.defaults.categories, {})
+  }
+  // Only `name(...)` over constant data: method calls and spread arguments stay rejected.
+  for (const call of ['m.f([{providers:["one"],model:"fast"}])', 'f(...x)']) {
+    writeFileSync(join(h.extensions, "omo-task.js"), `var m={},x=[];function f(e){return e}var c={quick:[{providers:["one"],model:"fast"}],deep:[{providers:["two"],model:"x"}]};var d=[{name:"quick",config:{model:${call}}}];`)
+    assert.match(routing.loadBuiltinRouting(h.env).defaults.unavailable.categories ?? "", /unsupported default model/, call)
+  }
+})
+
 test("a name whose binding is not constant data is unsupported, not guessed", t => {
   const h = fixture(t)
   const table = `var c={quick:[{providers:["one"],model:m.fast}]};`

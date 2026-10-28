@@ -286,16 +286,24 @@ a JS parser reads the minified syntax (`!0`, `void 0`, spreads, quoting), not
 a hand-written tokenizer. Tables are recognized by their AST shape, not by
 minified variable names, field order or category names. Only constant data is
 evaluated — literals, operators over them, arrays and plain objects — in a
-separate `vm` context; calls, functions and computed or prototype member reads
-are rejected before evaluation. The bundles are never imported or run, and no
-model list is copied into this extension. A name the data refers to — a shared
+separate `vm` context; function literals, method calls and computed or
+prototype member reads are rejected before evaluation. The bundles are never
+imported or run as a whole, and no model list is copied into this extension. A name the data refers to — a shared
 provider list spread into a rung (`providers:[...a8]`), a model bound to a name
 (`model:Rb`) or read from a constant object (`model:oa.geminiPro`, OMO 5.1.48)
 — is read from what the same bundle binds it to (`a8=[...]`, `Rb="..."`,
 `oa={...}`). Every binding of that name must be constant data with the same
 value, and the name must never be changed afterwards (member or compound
 assignment, `++`, `delete`, destructuring, passed to a call); otherwise the
-section is unsupported rather than guessed. The result is cached until the bundle contents change. Missing
+section is unsupported rather than guessed. A chain handed to one of the
+bundle's own functions (`architect:va([...])`, OMO 5.1.51's launch gate that
+drops the rungs of a model not released yet) is read as what that function
+returns, run the way the host runs it. Only `name(constant, ...)` calls are
+accepted; every definition of the name must be the same source and it must not
+be rebound. The names the function reads from outside are bound only to the
+same bundle's constant data or to such functions; any other name (a logger, a
+mutated list, `console`, `Date`, `Math`) throws when reached, and the section
+is unsupported. The result is cached until the bundle contents change. Missing
 files, a missing parser, unsupported expressions, or ambiguous tables produce
 a visible warning for the affected section. Restart/reload the host after
 upgrading OMO so the source on disk and the running host agree.
