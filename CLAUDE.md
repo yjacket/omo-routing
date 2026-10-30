@@ -11,8 +11,10 @@ A Senpi/OMO extension (`extension/routing.ts`, `routing-policy.ts`, `routing-run
 ```sh
 node --test                                   # all tests (Node >= 22.6; .mjs tests import the .ts via built-in type stripping; run inside omo or set OMO_BIN: fixtures borrow omo-ai's @babel/parser and one test reads the installed bundles)
 node --test --test-name-pattern="profile"     # single test by name substring
-omo install <path-to-this-clone>              # install the working tree as an omo package (users: omo install git:github.com/yjacket/omo-routing), then /reload
+omo install <path-to-this-clone>              # dev check only; switch back to omo install git:github.com/yjacket/omo-routing afterwards, then /reload
 ```
+
+Work in a worktree and land changes through a PR: `master` only accepts PRs whose `test` check (.github/workflows/test.yml, windows-latest, omo-ai installed) passes. Live checks use a temp HOME/USERPROFILE/APPDATA/LOCALAPPDATA and OMO_/PI_/SENPI_CODING_AGENT_DIR, never the real `~/.omo`. Do not commit `.omo/` scratch. After an omo release, run `loadBuiltinRouting` against the new bundles and require every section to load.
 
 No build step, no lint, no dependencies. Never test against a live paid OMO session; the fake `pi`/`ctx` harnesses (`test/editor-command.test.mjs` with a fake `ui.custom` and model registry, `test/editor-fixture.mjs`) are the only runtime used. A live check of `/routing` sends no prompt: slash commands never reach the model.
 

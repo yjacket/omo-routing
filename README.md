@@ -316,15 +316,27 @@ omo install git:github.com/yjacket/omo-routing
 
 omo clones the repository into `~/.omo/agent/git/github.com/yjacket/omo-routing` and adds it to `packages` in `~/.omo/agent/settings.json`. Type `/reload` in running sessions.
 
-**Update:** `omo update --extensions` (every installed package) or `omo update git:github.com/yjacket/omo-routing`, then `/reload`.
+**Update:** `omo update --extensions` updates every git-installed extension; `omo update --extension git:github.com/yjacket/omo-routing` updates only this one. Running sessions pick the change up after `/reload` or in a new session.
 
 If you installed the single file before, delete `~/.omo/agent/extensions/routing.ts`, or it loads next to the package. Then run `/routing`.
 
-## Tests
+## Development
+
+Work in a git worktree on a branch and open a PR against `master`. The branch is protected: changes land only through a PR whose `test` check passes, and direct pushes, force pushes and branch deletion are blocked. The `test` workflow runs `npm test` on `windows-latest` with omo-ai installed globally and `OMO_BIN` pointed at it, so the bundle tests really run.
+
+Run the tests locally with:
 
 ```sh
-node --test
+npm test
 ```
+
+To try a working tree in omo, `omo install <path-to-this-clone>` works for a quick check. Switch back to `omo install git:github.com/yjacket/omo-routing` afterwards.
+
+Keep live checks away from your real setup: point `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and `OMO_`/`PI_`/`SENPI_CODING_AGENT_DIR` at a temp directory, because the editor writes `~/.omo/omo.jsonc` and omo hot-reloads it in every running session.
+
+### Tests
+
+`npm test` runs `node --test`.
 
 Node ≥ 22.6: tests are `.mjs` and import `extension/routing.ts` directly
 through Node's built-in type stripping. A fake `pi`/`ctx` harness supplies the
