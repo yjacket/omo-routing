@@ -1,0 +1,28 @@
+name: test
+on:
+  pull_request:
+  push:
+    branches: [master]
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install omo engine (omo-ai)
+        run: npm install -g omo-ai
+      - name: point tests at the installed engine
+        shell: bash
+        run: |
+          node -e '
+            const p = require("path"), fs = require("fs");
+            const root = p.join(require("child_process").execSync("npm root -g").toString().trim(), "omo-ai");
+            const senpi = [p.join(root, "node_modules", "@code-yeongyu", "senpi"), p.join(root, "..", "@code-yeongyu", "senpi")].find(d => fs.existsSync(p.join(d, "package.json")));
+            if (!senpi) throw new Error("senpi runtime not found next to " + root);
+            const lines = ["OMO_BIN=" + p.join(root, "bin", "omo.js"), "OMO_TIPS_RUNTIME_ROOT=" + senpi, "OMO_WHERE_RUNTIME=" + p.join(senpi, "dist", "index.js")];
+            console.log(lines.join("\n"));
+            fs.appendFileSync(process.env.GITHUB_ENV, lines.join("\n") + "\n");
+          '
+      - run: npm test
