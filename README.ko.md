@@ -294,15 +294,27 @@ omo install git:github.com/yjacket/omo-routing
 
 omo가 저장소를 `~/.omo/agent/git/github.com/yjacket/omo-routing`에 클론하고 `~/.omo/agent/settings.json`의 `packages`에 등록합니다. 실행 중인 세션에서 `/reload`를 입력하세요.
 
-**업데이트:** `omo update --extensions`(설치된 패키지 전부) 또는 `omo update git:github.com/yjacket/omo-routing`를 실행한 뒤 `/reload`를 입력하세요.
+**업데이트:** `omo update --extensions`는 git으로 설치한 확장을 모두 업데이트하고, `omo update --extension git:github.com/yjacket/omo-routing`은 이 확장만 업데이트합니다. 실행 중인 세션은 `/reload` 뒤나 새 세션에서 반영됩니다.
 
 예전에 파일 하나로 설치했다면 `~/.omo/agent/extensions/routing.ts`를 지우세요. 남겨 두면 패키지와 함께 로드됩니다. 그다음 `/routing`을 실행하세요.
 
-## 테스트
+## 개발
+
+git worktree에서 브랜치를 만들어 작업하고 `master`로 PR을 엽니다. 기본 브랜치는 보호되어 `test` 검사를 통과한 PR로만 변경이 들어가며, 직접 push, force push, 브랜치 삭제는 막혀 있습니다. `test` 워크플로는 `windows-latest`에서 omo-ai를 전역 설치하고 `OMO_BIN`을 그쪽으로 지정한 뒤 `npm test`를 실행하므로 번들 테스트도 실제로 돕니다.
+
+로컬 테스트:
 
 ```sh
-node --test
+npm test
 ```
+
+작업 트리를 omo에서 잠깐 확인할 때는 `omo install <이 클론 경로>`를 써도 됩니다. 확인이 끝나면 `omo install git:github.com/yjacket/omo-routing`으로 되돌리세요.
+
+실사용 환경은 건드리지 마세요. 편집기는 `~/.omo/omo.jsonc`를 쓰고 omo는 실행 중인 모든 세션에서 이를 다시 불러오므로, 라이브 확인 때는 `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`와 `OMO_`/`PI_`/`SENPI_CODING_AGENT_DIR`을 임시 디렉터리로 지정합니다.
+
+### 테스트
+
+`npm test`는 `node --test`를 실행합니다.
 
 Node ≥ 22.6 필요: 테스트는 `.mjs` 이며 Node 내장 타입 스트리핑으로
 `extension/routing.ts` 를 직접 import 합니다. 가짜 `pi`/`ctx` 하네스가 명령
