@@ -164,7 +164,11 @@ const errorText = (error: unknown): string => error instanceof Error ? error.mes
 // recognized by AST shape, never by minifier names or category names, and only
 // constant data is evaluated. Since 5.1.48 the tables reach that data through
 // names (`model:oa.geminiPro`, `model:Rb`, `providers:[...tae]`), which are
-// resolved to the constant data the same bundle binds them to.
+// resolved to the constant data the same bundle binds them to. Since 5.1.51 a
+// chain can also be passed through one of the bundle's own functions
+// (`architect:va([...])`, a launch gate that drops rungs of an unreleased
+// model); such a call is run the way the host runs it, with only the bundle's
+// constant data and functions in reach (see `bindFunction`).
 
 type AstNode = { type: string; start: number; end: number; [key: string]: any }
 type Bundle = {
@@ -179,6 +183,11 @@ type Bundle = {
   /** Names changed after binding: compound or member assignment, ++/--, delete,
    * destructuring, for-in/of, or handed to a call that could mutate them. */
   mutated: Set<string>
+  /** Names given a new value other than by a plain `name=` (compound
+   * assignment, ++/--, destructuring, for-in/of): a function so named is not
+   * the function its definition shows. Handing a function to a call does not
+   * change what calling it does, so functions are checked against this. */
+  rebound: Set<string>
   context: Record<string, unknown>
 }
 
@@ -195,8 +204,10 @@ const propertyOf = (node: AstNode, key: string): AstNode | undefined =>
 const keysOf = (node: AstNode): (string | undefined)[] => node.properties.map(keyOf)
 const isRung = (node: AstNode | null): boolean => node?.type === "ObjectExpression"
   && propertyOf(node, "providers") !== undefined && propertyOf(node, "model") !== undefined
-const isChain = (node: AstNode | undefined): boolean =>
-  node?.type === "ArrayExpression" && node.elements.length > 0 && node.elements.every(isRung)
+/** A literal chain, or a literal chain handed to a bundle function: `f([...])`. */
+const isChain = (node: AstNode | undefined): boolean => node?.type === "CallExpression"
+  ? node.callee.type === "Identifier" && node.arguments.length === 1 && isChain(node.arguments[0])
+  : node?.type === "ArrayExpression" && node.elements.length > 0 && node.elements.every(isRung)
 const isTableOf = (node: AstNode, entry: (value: AstNode) => boolean): boolean => node.type === "ObjectExpression"
   && node.properties.length > 0 && node.properties.every((property: AstNode) => keyOf(property) !== undefined && entry(property.value))
 const isProfile = (node: AstNode): boolean => node.type === "ObjectExpression" && isChain(propertyOf(node, "models"))
@@ -205,6 +216,10 @@ const isAgentTable = (node: AstNode): boolean => ["explore", "librarian"].every(
 const CONSTANT_UNARY = new Set(["!", "-", "+", "~", "void"])
 const CONSTANT_GLOBALS = new Set(["undefined", "NaN", "Infinity"])
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"])
+/** Deterministic, side-effect-free builtins a bundle function may use. Every
+ * other global (console, Date, Math, process...) throws when it is reached. */
+const PURE_GLOBALS = new Set([...CONSTANT_GLOBALS, "Array", "Object", "String", "Number", "Boolean", "JSON", "Set", "Map"])
+const FUNCTION_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"])
 
 /** The root name of a plain reference: `name`, `name.key`, `name["key"]`,
  * `name.key[0]`; undefined for anything else (calls, `this`, computed keys). */
@@ -220,8 +235,10 @@ function referenceRoot(node: AstNode): string | undefined {
 /** Constant data only: literals, operators over constants, arrays, plain
  * objects, and references (a name, member reads of it, array spreads of it)
  * whose roots are collected into `refs` (name -> how it was used, for errors)
- * and must themselves resolve to constant data. Calls, functions and every
- * other expression are rejected before anything is evaluated. */
+ * and must themselves resolve to constant data. A call is accepted only as
+ * `name(constant, ...)`, where `name` must resolve to a function of the same
+ * bundle (`bindFunction`). Function literals, method calls and every other
+ * expression are rejected before anything is evaluated. */
 function isConstant(node: AstNode | null, refs: Map<string, string>): boolean {
   if (node === null) return true // array hole
   switch (node.type) {
@@ -256,9 +273,103 @@ function isConstant(node: AstNode | null, refs: Map<string, string>): boolean {
       })
     case "ObjectExpression":
       return node.properties.every((property: AstNode) => keyOf(property) !== undefined && isConstant(property.value, refs))
+    case "CallExpression":
+      if (node.callee.type !== "Identifier" || CONSTANT_GLOBALS.has(node.callee.name)) return false
+      if (!refs.has(node.callee.name)) refs.set(node.callee.name, `${node.callee.name}(...)`)
+      return node.arguments.every((argument: AstNode) => argument.type !== "SpreadElement" && isConstant(argument, refs))
     default:
       return false
   }
+}
+
+/** Names a function reads from outside itself. Over-approximates what it
+ * declares (any name bound anywhere inside counts as local), so a name it
+ * shadows is left out and, if reached at run time, is a ReferenceError. */
+function freeNames(fn: AstNode): Set<string> {
+  const declared = new Set<string>()
+  const used = new Set<string>()
+  const visit = (node: AstNode, parent?: AstNode, key?: string): void => {
+    if (node.type === "Identifier") {
+      const label = key === "label"
+      const property = key === "property" && !parent?.computed && /MemberExpression$/.test(parent?.type ?? "")
+      const objectKey = key === "key" && !parent?.computed
+      if (!label && !property && !objectKey) used.add(node.name)
+      return
+    }
+    if (FUNCTION_TYPES.has(node.type) || node.type === "ObjectMethod" || node.type === "ClassMethod") {
+      if (node.id) declared.add(node.id.name)
+      for (const param of node.params) for (const name of patternNames(param)) declared.add(name)
+    } else if (node.type === "VariableDeclarator") for (const name of patternNames(node.id)) declared.add(name)
+    else if (node.type === "CatchClause" && node.param) for (const name of patternNames(node.param)) declared.add(name)
+    else if (node.type === "ClassDeclaration" && node.id) declared.add(node.id.name)
+    for (const [childKey, child] of Object.entries(node))
+      for (const item of Array.isArray(child) ? child : [child])
+        if (item !== null && typeof item === "object" && typeof item.type === "string") visit(item, node, childKey)
+  }
+  visit(fn)
+  for (const name of declared) used.delete(name)
+  return used
+}
+
+/** Binds `name` to a function of the bundle, run as the host runs it. OMO
+ * passes chains through its own functions (5.1.51: a launch gate that drops the
+ * rungs of a model not released yet), so the chain the host routes is that
+ * function's result, not its argument. The function is created inside the vm
+ * context, every definition of the name must be the same source, and it must
+ * not be rebound. Whatever it reads from outside is bound the same way, as
+ * constant data or such a function; a name that is neither (a logger, a
+ * mutated list, Date, console...) throws when reached, so a path that depends
+ * on it leaves the section unsupported instead of guessing. */
+function bindFunction(bundle: Bundle, name: string, use: string, definitions: AstNode[], depth: number): void {
+  const sources = new Set(definitions.map(definition => bundle.source.slice(definition.start, definition.end)))
+  if (sources.size !== 1) throw new UnsupportedBundle(`${bundle.file}: conflicting definitions of ${use}`)
+  const [definition] = definitions
+  if (definition.async || definition.generator) throw new UnsupportedBundle(`${bundle.file}: ${use} is not a plain function`)
+  if (bundle.rebound.has(name)) throw new UnsupportedBundle(`${bundle.file}: ${use} is changed after it is defined`)
+  const [source] = sources
+  try {
+    bundle.context[name] = runInContext(`(${source})`, bundle.context, { timeout: 100 })
+  } catch (error) {
+    throw new UnsupportedBundle(`${bundle.file}: cannot evaluate ${use}: ${errorText(error)}`)
+  }
+  // Bound before its own reads, so recursion and mutual references terminate.
+  for (const free of freeNames(definition)) {
+    if (Object.hasOwn(bundle.context, free)) continue
+    try {
+      bind(bundle, free, free, depth - 1)
+    } catch (error) {
+      if (!(error instanceof UnsupportedBundle)) throw error
+      if (PURE_GLOBALS.has(free)) continue
+      // Defined from inside the context, so the getter belongs to its realm.
+      runInContext(`Object.defineProperty(globalThis, ${JSON.stringify(free)}, { get() { throw new ReferenceError(${JSON.stringify(`${free} is not constant data`)}) } })`, bundle.context)
+    }
+  }
+}
+
+/** Binds a referenced name in the bundle's vm context: constant data, or a
+ * function of the bundle (`bindFunction`). */
+function bind(bundle: Bundle, name: string, use: string, depth: number): void {
+  const definitions = bundle.bindings.get(name) ?? []
+  if (!definitions.length) throw new UnsupportedBundle(`${bundle.file}: no constant data defines ${use}`)
+  if (depth <= 0) throw new UnsupportedBundle(`${bundle.file}: ${use} is nested too deeply`)
+  if (definitions.every(definition => FUNCTION_TYPES.has(definition.type))) {
+    bindFunction(bundle, name, use, definitions, depth)
+    return
+  }
+  if (bundle.mutated.has(name)) throw new UnsupportedBundle(`${bundle.file}: ${use} is changed after it is defined`)
+  const values = new Set(definitions.map(definition => {
+    if (!isConstant(definition, new Map()))
+      throw new UnsupportedBundle(`${bundle.file}: ${use} is bound to non-constant data at offset ${definition.start}`)
+    try {
+      return JSON.stringify(evaluate(bundle, definition, depth - 1)) ?? "undefined"
+    } catch (error) {
+      if (!(error instanceof UnsupportedBundle)) throw error
+      throw new UnsupportedBundle(`${bundle.file}: ${use} is bound to non-constant data at offset ${definition.start} (${error.message})`)
+    }
+  }))
+  if (values.size !== 1) throw new UnsupportedBundle(`${bundle.file}: conflicting definitions of ${use}`)
+  const [value] = values
+  bundle.context[name] = value === "undefined" ? undefined : JSON.parse(value)
 }
 
 /** The value of a constant-data node. A referenced name reads the constant data
@@ -266,25 +377,11 @@ function isConstant(node: AstNode | null, refs: Map<string, string>): boolean {
  * every binding of the name must be constant data with the same value, and the
  * name must never be changed after binding. No binding, a non-constant one,
  * differing ones or a mutation are unsupported rather than guessed. */
-function evaluate(bundle: Bundle, node: AstNode, depth = 3): unknown {
+function evaluate(bundle: Bundle, node: AstNode, depth = 6): unknown {
   const refs = new Map<string, string>()
   if (!isConstant(node, refs))
     throw new UnsupportedBundle(`${bundle.file}: non-constant expression in builtin data at offset ${node.start}`)
-  for (const [name, use] of refs) {
-    if (Object.hasOwn(bundle.context, name)) continue
-    const definitions = bundle.bindings.get(name) ?? []
-    if (!definitions.length) throw new UnsupportedBundle(`${bundle.file}: no constant data defines ${use}`)
-    if (bundle.mutated.has(name)) throw new UnsupportedBundle(`${bundle.file}: ${use} is changed after it is defined`)
-    if (depth === 0) throw new UnsupportedBundle(`${bundle.file}: ${use} is nested too deeply`)
-    const values = new Set(definitions.map(definition => {
-      if (!isConstant(definition, new Map()))
-        throw new UnsupportedBundle(`${bundle.file}: ${use} is bound to non-constant data at offset ${definition.start}`)
-      return JSON.stringify(evaluate(bundle, definition, depth - 1)) ?? "undefined"
-    }))
-    if (values.size !== 1) throw new UnsupportedBundle(`${bundle.file}: conflicting definitions of ${use}`)
-    const [value] = values
-    bundle.context[name] = value === "undefined" ? undefined : JSON.parse(value)
-  }
+  for (const [name, use] of refs) if (!Object.hasOwn(bundle.context, name)) bind(bundle, name, use, depth)
   // Constant data cannot run code; the VM only supplies JS semantics, and the
   // result is copied out of its realm.
   let value: unknown
@@ -313,13 +410,20 @@ function parseBundle(file: string, source: string, parse: (source: string) => As
   }
   const bundle: Bundle = {
     file, source, chainTables: [], profileTables: [], definitions: [], bindings: new Map(), mutated: new Set(),
-    context: createContext(Object.create(null)),
+    rebound: new Set(), context: createContext(Object.create(null)),
   }
-  const mutate = (target: AstNode | null | undefined): void => {
+  const mutate = (target: AstNode | null | undefined, rebinding = true): void => {
     if (!target) return
-    const root = target.type === "MemberExpression" ? memberRoot(target) : target.type === "Identifier" ? target.name : undefined
-    if (root !== undefined) bundle.mutated.add(root)
-    else for (const name of patternNames(target)) bundle.mutated.add(name)
+    if (target.type === "MemberExpression") {
+      const root = memberRoot(target)
+      if (root !== undefined) bundle.mutated.add(root)
+      return
+    }
+    const names = target.type === "Identifier" ? [target.name] : patternNames(target)
+    for (const name of names) {
+      bundle.mutated.add(name)
+      if (rebinding) bundle.rebound.add(name)
+    }
   }
   const stack = [program]
   while (stack.length) {
@@ -336,10 +440,11 @@ function parseBundle(file: string, source: string, parse: (source: string) => As
     else if (node.type === "ForInStatement" || node.type === "ForOfStatement") {
       if (node.left.type !== "VariableDeclaration") mutate(node.left)
     } else if (node.type === "CallExpression" || node.type === "NewExpression" || node.type === "OptionalCallExpression") {
-      for (const argument of node.arguments) mutate(argument.type === "SpreadElement" ? argument.argument : argument)
+      for (const argument of node.arguments) mutate(argument.type === "SpreadElement" ? argument.argument : argument, false)
       // `name.method(...)` may change name in place (push, splice, sort...).
-      if (node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression") mutate(node.callee.object)
-    }
+      if (node.callee.type === "MemberExpression" || node.callee.type === "OptionalMemberExpression") mutate(node.callee.object, false)
+    } else if (node.type === "FunctionDeclaration" && node.id)
+      bundle.bindings.set(node.id.name, [...(bundle.bindings.get(node.id.name) ?? []), node])
     if (node.type === "ObjectExpression") {
       if (isTableOf(node, isChain)) bundle.chainTables.push(node)
       else if (isTableOf(node, isProfile)) bundle.profileTables.push(node)
