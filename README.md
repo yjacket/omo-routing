@@ -59,7 +59,10 @@ only the policy-owned edits. Removing a policy reverses those contributions,
 not an old whole-file backup; unrelated edits survive. File writes are guarded
 by a cross-session lock and an external-change check. A busy lock is waited on
 for up to 2 seconds; one left behind by a crashed session is cleared after 30
-seconds. Do not delete the receipt
+seconds. Each file is flushed to disk before it replaces the old one. If a
+crash still leaves the policies file unreadable, it is moved to
+`routing-policies.json.corrupt-<time>`, one warning says so, and routing goes on
+with default settings and no receipt. Do not delete the receipt
 while policies are applied. Signal failures keep the previous cache and are
 shown in the `p` menu; refreshing also honours the one-minute limit.
 Refresh writes are deferred while the editor has unsaved work. The policy

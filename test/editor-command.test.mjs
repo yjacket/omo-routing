@@ -733,3 +733,20 @@ test("late source refresh after session shutdown cannot write routing or reuse t
   assert.equal(readFileSync(h.cfgPath, "utf8"), CONFIG)
   assert.equal(h.statuses.length, statusCount)
 })
+
+test("a policies file a crash left as NUL bytes warns once, is moved aside, and never breaks a turn", BOUND, async t => {
+  // Given: the state a blue screen left behind (seen on 2026-11-03 and 2026-11-11).
+  const h = setup(t, { now: () => POLICY_NOW })
+  const state = join(h.home, ".omo", "routing-policies.json")
+  writeFileSync(state, Buffer.alloc(767))
+
+  // When: several turns start.
+  for (let turn = 0; turn < 3; turn++) assert.equal(await h.fire("before_agent_start"), undefined)
+
+  // Then: one warning naming where the bytes went, kept verbatim; no parse errors.
+  const warnings = h.notes.filter(note => note.kind === "warning")
+  assert.equal(warnings.length, 1, JSON.stringify(h.notes))
+  assert.match(warnings[0].message, /unreadable.*moved it to .*routing-policies\.json\.corrupt-20261023T160000Z/)
+  assert.equal(existsSync(state), false)
+  assert.deepEqual(readFileSync(`${state}.corrupt-20261023T160000Z`), Buffer.alloc(767))
+})

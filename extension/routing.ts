@@ -2849,6 +2849,10 @@ export function createRouting(pi: any, deps: Deps = {}) {
     const base = policies.base(current, path)
     policies.write({ path, base, current, baseBefore: base, builtin: loadBuiltinRouting(env), backup: false })
   }
+  const announce = (ctx: PolicyContext): void => {
+    const notice = policies.takeNotice()
+    if (notice) ctx.ui?.notify?.(`routing: ${notice}`, "warning")
+  }
   if (typeof pi.on === "function") {
     let generation = 0
     pi.on("session_start", (_event: unknown, ctx: PolicyContext) => {
@@ -2857,8 +2861,10 @@ export function createRouting(pi: any, deps: Deps = {}) {
       let timer: ReturnType<typeof setInterval> | undefined
       let refreshing = false
       const updateStatus = (): void => {
-        try { ctx.ui?.setStatus?.("omo-routing", policies.status()) }
-        catch { /* A replaced extension runner no longer owns this UI. */ }
+        try {
+          ctx.ui?.setStatus?.("omo-routing", policies.status())
+          announce(ctx)
+        } catch { /* A replaced extension runner no longer owns this UI. */ }
       }
       const refresh = async (): Promise<void> => {
         if (refreshing || editing) return
@@ -2886,6 +2892,7 @@ export function createRouting(pi: any, deps: Deps = {}) {
       if (!path) return undefined
       try {
         const state = policies.state()
+        announce(ctx)
         const disk = readFileSync(path, "utf8")
         const preview = policies.preview(policies.base(disk, path), loadBuiltinRouting(env))
         const configured = applyProfile(parseJsonc(disk), resolveProfileName(env)).config
