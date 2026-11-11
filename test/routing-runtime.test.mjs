@@ -1,10 +1,11 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync } from "node:fs"
+import * as fs from "node:fs"
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
-import { RoutingPolicies } from "../extension/routing-runtime.ts"
+import { RoutingPolicies, atomic } from "../extension/routing-runtime.ts"
 import { applyDrafts, applyProfile, parseJsonc, saveConfig } from "../extension/routing.ts"
 import { composePolicies, overlayKey } from "../extension/routing-policy.ts"
 import { BUILTIN } from "./editor-fixture.mjs"
@@ -303,4 +304,55 @@ test("a server clock running ahead does not switch the promotion off right after
   // Then: the schedule is dated by our clock and the promotion still leads quick.
   assert.equal(h.policies.state().promo.fetchedAt, NOW)
   assert.equal(config(h.path)["[native]"].categories.quick.models[0], `${MODEL}:low`)
+})
+
+test("an unreadable state file is moved aside once and later sessions use the fresh state silently", t => {
+  const h = fixture(t)
+  writeFileSync(h.policies.statePath, "\0".repeat(767))
+  assert.equal(h.policies.state().promoEnabled, true)
+  assert.match(h.policies.takeNotice(), /moved it to .*\.corrupt-20261023T160000Z/)
+  assert.equal(h.policies.takeNotice(), undefined)
+  h.policies.setPromo(false)
+
+  const other = new RoutingPolicies(h.home, { now: () => NOW })
+  assert.equal(other.state().promoEnabled, false)
+  assert.equal(other.takeNotice(), undefined)
+  const dir = join(h.home, ".omo")
+  assert.deepEqual(readdirSync(dir).filter(name => name.includes(".corrupt-")), ["routing-policies.json.corrupt-20261023T160000Z"])
+
+  // A second crash in the same second keeps the first evidence.
+  writeFileSync(h.policies.statePath, "{")
+  other.state()
+  assert.match(other.takeNotice(), /\.corrupt-20261023T160000Z-2/)
+  assert.equal(readFileSync(join(dir, "routing-policies.json.corrupt-20261023T160000Z"), "utf8"), "\0".repeat(767))
+})
+
+test("a file of the wrong shape is recovered like a corrupt one instead of failing every read", t => {
+  const h = fixture(t)
+  writeFileSync(h.policies.statePath, JSON.stringify({ version: 1, promoEnabled: "yes" }))
+  assert.equal(h.policies.summary().startsWith("임시 정책"), true)
+  assert.match(h.policies.takeNotice(), /unreadable/)
+})
+
+test("replacing a file flushes its data before the rename and the directory after it", t => {
+  const dir = mkdtempSync(join(tmpdir(), "routing-durable-"))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, "state.json")
+  const calls = []
+  const names = new Map()
+  const io = {
+    openSync: (file, flag) => { const fd = fs.openSync(file, flag); names.set(fd, file === dir ? "dir" : "temp"); calls.push(`open ${names.get(fd)} ${flag}`); return fd },
+    writeSync: (fd, ...rest) => { calls.push(`write ${names.get(fd)}`); return fs.writeSync(fd, ...rest) },
+    fsyncSync: fd => { calls.push(`fsync ${names.get(fd)}`); return fs.fsyncSync(fd) },
+    closeSync: fd => { calls.push(`close ${names.get(fd)}`); return fs.closeSync(fd) },
+    renameSync: (from, to) => { calls.push("rename"); return fs.renameSync(from, to) },
+    rmSync: (...args) => { calls.push("rm"); return fs.rmSync(...args) },
+  }
+  atomic(path, "{}\n", io)
+  assert.equal(readFileSync(path, "utf8"), "{}\n")
+  assert.deepEqual(calls.slice(0, 5), ["open temp w", "write temp", "fsync temp", "close temp", "rename"])
+  // POSIX flushes a read-only directory handle; Windows needs read-write (EPERM otherwise).
+  const dirCalls = calls.slice(5)
+  assert.ok(dirCalls.includes("fsync dir"), dirCalls.join(", "))
+  assert.equal(dirCalls.at(-1), "close dir")
 })

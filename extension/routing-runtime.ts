@@ -1,4 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import * as fs from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
@@ -38,20 +39,46 @@ const initial = (): PolicyState => ({
 })
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex")
 
-function atomic(path: string, text: string): void {
+class LockBusy extends Error {
+  constructor() { super("routing policies are being saved by another session; try again") }
+}
+
+export type DurableFs = Pick<typeof fs, "openSync" | "writeSync" | "fsyncSync" | "closeSync" | "renameSync" | "rmSync">
+
+/** Flush a directory entry change. POSIX fsyncs a read-only directory handle;
+ * Windows (Node and Bun alike) refuses that with EPERM but flushes a handle
+ * opened read-write. Elsewhere a directory flush is not offered, and the
+ * rename is as durable as the file system makes it. */
+function syncDir(dir: string, io: DurableFs): void {
+  for (const flag of ["r", "r+"]) {
+    let fd: number
+    try { fd = io.openSync(dir, flag) } catch { continue }
+    try { io.fsyncSync(fd); return } catch { /* try the next mode */ } finally { io.closeSync(fd) }
+  }
+}
+
+/** Replace a file so that a crash leaves either the old or the new content:
+ * the data reaches the disk before the rename can (a rename kept without its
+ * data is how a blue screen left 767 NUL bytes on 2026-11-03 and 2026-11-11). */
+export function atomic(path: string, text: string, io: DurableFs = fs): void {
   const temp = `${path}.${process.pid}.tmp`
-  writeFileSync(temp, text, "utf8")
+  const fd = io.openSync(temp, "w")
+  try {
+    io.writeSync(fd, text, null, "utf8")
+    io.fsyncSync(fd)
+  } finally { io.closeSync(fd) }
   // Windows refuses to replace a file another process is reading (Bun opens it
   // without delete sharing), and sessions read these files without the lock.
   const deadline = Date.now() + 2_000
   for (;;) {
     try {
-      renameSync(temp, path)
+      io.renameSync(temp, path)
+      syncDir(dirname(path), io)
       return
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (!(code === "EPERM" || code === "EACCES" || code === "EBUSY") || Date.now() >= deadline) {
-        rmSync(temp, { force: true })
+        io.rmSync(temp, { force: true })
         throw error
       }
     }
@@ -68,6 +95,9 @@ export class RoutingPolicies {
   private readonly now: () => number
   private readonly fetcher: typeof fetch
   private readonly lockWaitMs: number
+  private holding = false
+  private readonly recovered = new Set<string>()
+  private readonly notices: string[] = []
 
   constructor(home: string, options: { readonly now?: () => number; readonly fetcher?: typeof fetch; readonly lockWaitMs?: number } = {}) {
     this.home = home
@@ -79,13 +109,58 @@ export class RoutingPolicies {
   }
 
   state(): PolicyState {
-    let value: unknown
+    let text: string
     try {
-      value = JSON.parse(readFileSync(this.statePath, "utf8"))
+      text = readFileSync(this.statePath, "utf8")
     } catch (error) {
       if (!missing(error)) throw error
       return initial()
     }
+    return this.parse(text) ?? this.recover(text)
+  }
+
+  /** Notices for the user, each returned once (a moved-aside corrupt file). */
+  takeNotice(): string | undefined {
+    return this.notices.length ? this.notices.splice(0).join("\n") : undefined
+  }
+
+  /** A crash can leave the file unreadable (all NUL bytes, seen twice). Its
+   * settings and receipt are lost either way, so start from no policy state and
+   * keep the bytes beside it as evidence. Only the session that moves the file
+   * reports it, and each session handles one content once. */
+  private recover(text: string): PolicyState {
+    const key = digest(text)
+    if (this.recovered.has(key)) return initial()
+    const move = (): void => {
+      let current: string
+      try { current = readFileSync(this.statePath, "utf8") } catch (error) { if (missing(error)) return; throw error }
+      // Another session moved it and saved fresh state meanwhile.
+      if (current !== text) return
+      const stamp = new Date(this.now()).toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")
+      let target = `${this.statePath}.corrupt-${stamp}`
+      for (let n = 2; existsSync(target); n++) target = `${this.statePath}.corrupt-${stamp}-${n}`
+      try {
+        renameSync(this.statePath, target)
+      } catch {
+        // A Windows reader blocks the rename; keep a copy, the next save replaces the file.
+        copyFileSync(this.statePath, target)
+      }
+      this.notices.push(`${this.statePath} was unreadable (a crash during a write?); moved it to ${target} and continued without saved policy state`)
+    }
+    try {
+      if (this.holding) move()
+      else this.locked(move)
+    } catch (error) {
+      if (error instanceof LockBusy) return initial()
+      this.notices.push(`${this.statePath} is unreadable and could not be moved aside (${errorText(error)}); continuing without saved policy state`)
+    }
+    this.recovered.add(key)
+    return initial()
+  }
+
+  private parse(text: string): PolicyState | undefined {
+    let value: unknown
+    try { value = JSON.parse(text) } catch { return undefined }
     if (!record(value) || value.version !== 1 || typeof value.promoEnabled !== "boolean"
       || !(value.switchProfile === undefined || value.switchProfile === null || typeof value.switchProfile === "string")
       || !(value.switchExclude === undefined || (record(value.switchExclude) && typeof value.switchExclude.alert === "string"
@@ -95,11 +170,8 @@ export class RoutingPolicies {
       || !(value.configPath === undefined || typeof value.configPath === "string")
       || !(value.receipt === undefined || isPolicyReceipt(value.receipt))
       || !(value.pending === undefined || (record(value.pending) && typeof value.pending.configPath === "string"
-        && typeof value.pending.digest === "string" && isPolicyReceipt(value.pending.receipt)))) {
-      throw new Error(`cannot read policy state: ${this.statePath}`)
-    }
-    if (!(value.codex === null || isCodexSignal(value.codex)))
-      throw new Error(`cannot read Codex signal: ${this.statePath}`)
+        && typeof value.pending.digest === "string" && isPolicyReceipt(value.pending.receipt)))
+      || !(value.codex === null || isCodexSignal(value.codex))) return undefined
     const codex = value.codex
     return {
       version: 1, promoEnabled: value.promoEnabled, switchProfile: value.switchProfile ?? null,
@@ -136,10 +208,11 @@ export class RoutingPolicies {
         try { rmdirSync(this.lockPath) } catch (error) { if (!missing(error)) throw error }
         continue
       }
-      if (Date.now() >= deadline) throw new Error("routing policies are being saved by another session; try again")
+      if (Date.now() >= deadline) throw new LockBusy()
       Atomics.wait(SLEEP, 0, 0, 25)
     }
-    try { return action() } finally { rmdirSync(this.lockPath) }
+    this.holding = true
+    try { return action() } finally { this.holding = false; rmdirSync(this.lockPath) }
   }
 
   private persist(state: PolicyState): void {
