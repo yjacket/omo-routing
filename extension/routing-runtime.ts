@@ -3,8 +3,8 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSyn
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
-import { composePolicies, isPolicyReceipt, unwrapPolicies } from "./routing-policy.ts"
-import type { PolicyReceipt, PolicySettings, PromoSchedule } from "./routing-policy.ts"
+import { composePolicies, isPolicyReceipt, PROMO_LANES, PROMO_THRESHOLDS, unwrapPolicies } from "./routing-policy.ts"
+import type { PolicyReceipt, PolicySettings, PromoLane, PromoSchedule, PromoThresholds } from "./routing-policy.ts"
 import { fetchCodexSignal, fetchPromoSchedule, isCodexSignal, signalStatus } from "./routing-signals.ts"
 import type { CodexSignal } from "./routing-signals.ts"
 import type { BuiltinRouting } from "./routing.ts"
@@ -14,7 +14,10 @@ const SLEEP = new Int32Array(new SharedArrayBuffer(4))
 
 type PolicyState = {
   readonly version: 1
+  /** Any lane on; kept beside promoLanes so an older reader sees the master switch. */
   readonly promoEnabled: boolean
+  /** Absent: every lane at its default threshold. */
+  readonly promoLanes?: PromoThresholds
   readonly switchProfile: string | null
   readonly switchExclude?: { readonly alert: string; readonly keys: readonly string[] }
   readonly promo: PromoSchedule | null
@@ -32,6 +35,12 @@ const finite = (value: unknown): value is number => typeof value === "number" &&
 const nullableNumber = (value: unknown): value is number | null => value === null || finite(value)
 const schedule = (value: unknown): value is PromoSchedule => record(value)
   && finite(value.fetchedAt) && finite(value.discountNow) && nullableNumber(value.nextAt) && nullableNumber(value.discountNext)
+const thresholds = (value: unknown): value is PromoThresholds => record(value)
+  && PROMO_LANES.every(({ key }) => value[key] === null || (finite(value[key]) && (value[key] as number) > 0 && (value[key] as number) <= 1))
+/** Effective per-lane thresholds: the master switch off turns every lane off. */
+export const promoLanesOf = (state: { readonly promoEnabled: boolean; readonly promoLanes?: PromoThresholds }): PromoThresholds =>
+  state.promoEnabled ? state.promoLanes ?? PROMO_THRESHOLDS : { quick: null, explore: null, librarian: null }
+const percent = (value: number | null): string => value === null ? "끔" : `${Math.round(value * 100)}%`
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const missing = (error: unknown): boolean => error instanceof Error && "code" in error && error.code === "ENOENT"
 const initial = (): PolicyState => ({
@@ -162,6 +171,7 @@ export class RoutingPolicies {
     let value: unknown
     try { value = JSON.parse(text) } catch { return undefined }
     if (!record(value) || value.version !== 1 || typeof value.promoEnabled !== "boolean"
+      || !(value.promoLanes === undefined || thresholds(value.promoLanes))
       || !(value.switchProfile === undefined || value.switchProfile === null || typeof value.switchProfile === "string")
       || !(value.switchExclude === undefined || (record(value.switchExclude) && typeof value.switchExclude.alert === "string"
         && Array.isArray(value.switchExclude.keys) && value.switchExclude.keys.every(key => typeof key === "string")))
@@ -174,7 +184,9 @@ export class RoutingPolicies {
       || !(value.codex === null || isCodexSignal(value.codex))) return undefined
     const codex = value.codex
     return {
-      version: 1, promoEnabled: value.promoEnabled, switchProfile: value.switchProfile ?? null,
+      version: 1, promoEnabled: value.promoEnabled,
+      ...(thresholds(value.promoLanes) ? { promoLanes: { quick: value.promoLanes.quick, explore: value.promoLanes.explore, librarian: value.promoLanes.librarian } } : {}),
+      switchProfile: value.switchProfile ?? null,
       ...(record(value.switchExclude) ? { switchExclude: { alert: value.switchExclude.alert as string, keys: value.switchExclude.keys as string[] } } : {}),
       promo: value.promo, codex, checkedAt: value.checkedAt, errors: value.errors,
       ...(value.configPath === undefined ? {} : { configPath: value.configPath }),
@@ -254,6 +266,7 @@ export class RoutingPolicies {
     const profile = this.activeProfile(state, raw)
     return {
       promo: state.promoEnabled ? state.promo : null,
+      promoLanes: promoLanesOf(state),
       overlay: profile === null ? null : {
         profile, exclude: state.switchExclude?.alert === state.codex?.alert?.at ? state.switchExclude.keys : [],
       },
@@ -294,7 +307,18 @@ export class RoutingPolicies {
   setPromo(on: boolean): void {
     this.locked(() => {
       const state = this.state()
-      this.persist({ ...state, promoEnabled: on })
+      const lanes = state.promoLanes && PROMO_LANES.some(({ key }) => state.promoLanes?.[key] !== null) ? state.promoLanes : undefined
+      const { promoLanes: _lanes, ...rest } = state
+      this.persist({ ...rest, promoEnabled: on, ...(lanes ? { promoLanes: lanes } : {}) })
+    })
+  }
+
+  /** Set one lane's minimum discount, null for off; the master switch follows. */
+  setPromoLane(lane: PromoLane, threshold: number | null): void {
+    this.locked(() => {
+      const state = this.state()
+      const promoLanes = { ...promoLanesOf(state), [lane]: threshold }
+      this.persist({ ...state, promoEnabled: PROMO_LANES.some(({ key }) => promoLanes[key] !== null), promoLanes })
     })
   }
 
@@ -364,6 +388,9 @@ export class RoutingPolicies {
 
   summary(): string {
     const state = this.state()
-    return `임시 정책: 할인 ${state.promoEnabled ? "자동" : "끔"} · 리셋 공지 때 전환 ${state.switchProfile ?? "끔"}${this.switching() === null ? "" : " (전환 중)"}`
+    const lanes = promoLanesOf(state)
+    const promo = PROMO_LANES.some(({ key }) => lanes[key] !== null)
+      ? PROMO_LANES.map(({ key }) => `${key} ${percent(lanes[key])}`).join(" ") : "끔"
+    return `임시 정책: 할인 ${promo} · 리셋 공지 때 전환 ${state.switchProfile ?? "끔"}${this.switching() === null ? "" : " (전환 중)"}`
   }
 }

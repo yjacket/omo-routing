@@ -4,7 +4,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { applyProfile, createRouting, parseJsonc, resolveProfileName, setJsoncPath } from "../extension/routing.ts"
+import { applyProfile, chainOf, createRouting, parseJsonc, resolveProfileName, setJsoncPath } from "../extension/routing.ts"
 import { RoutingPolicies } from "../extension/routing-runtime.ts"
 import { overlayKey } from "../extension/routing-policy.ts"
 import { fixtureDir } from "./fixture-dir.mjs"
@@ -658,14 +658,19 @@ test("the integrated prompt hook gates previews and automation and retracts its 
   assert.equal(await h.fire("before_agent_start"), undefined)
 })
 
-test("the policy menu persists promo toggles and cycles every saved switch profile back to off", BOUND, async t => {
+test("the policy menu cycles each DeepSeek lane's threshold and every saved switch profile back to off", BOUND, async t => {
   const h = setup(t, { config: APPLY_CONFIG, now: () => POLICY_NOW })
   const policies = policyState(h)
   const { editor, finished } = await h.open("")
-  press(editor, "p", "\x1b[F", KEY.up, KEY.enter)
-  assert.equal(policies.state().promoEnabled, false)
-  press(editor, KEY.enter)
-  assert.equal(policies.state().promoEnabled, true)
+  // Rows: quick, explore, librarian, then the switch (End selects the last).
+  press(editor, "p", "\x1b[F", KEY.up, KEY.up, KEY.up)
+  for (const quick of [0.75, 0.5, null, 0.9]) {
+    press(editor, KEY.enter)
+    assert.deepEqual(policies.state().promoLanes, { quick, explore: 0.9, librarian: 0.9 })
+    assert.equal(policies.state().promoEnabled, true)
+  }
+  press(editor, KEY.enter, KEY.enter, KEY.down, KEY.enter, KEY.enter, KEY.enter, KEY.down, KEY.enter, KEY.enter, KEY.enter)
+  assert.deepEqual(policies.state().promoLanes, { quick: 0.5, explore: null, librarian: null })
   press(editor, KEY.down)
   for (const name of ["work", "play", null]) {
     press(editor, KEY.enter)
@@ -673,6 +678,17 @@ test("the policy menu persists promo toggles and cycles every saved switch profi
   }
   press(editor, KEY.esc, "q")
   await finished
+
+  // Closing recomposes: only the lane still on keeps the DeepSeek rung.
+  const written = applyProfile(parseJsonc(readFileSync(h.cfgPath, "utf8")), undefined).config
+  assert.equal(chainOf(written.categories.quick)[0], `${PROMO_MODEL}:low`)
+  assert.notEqual(chainOf(written.agents?.explore ?? {})[0], `${PROMO_MODEL}:low`)
+
+  // Turning the last lane off clears the master switch an older reader checks.
+  policies.setPromoLane("quick", null)
+  assert.equal(policies.state().promoEnabled, false)
+  policies.setPromo(true)
+  assert.equal(policies.state().promoLanes, undefined, "re-enabling with every lane off restores the defaults")
 })
 
 test("saving chains during an active switch excludes only each edited layer and preserves its authored chain", BOUND, async t => {
