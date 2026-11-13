@@ -26,9 +26,15 @@ import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 import { createContext, runInContext } from "node:vm"
 import { isDeepStrictEqual } from "node:util"
-import { RoutingPolicies } from "./routing-runtime.ts"
-import { overlayKey } from "./routing-policy.ts"
+import { promoLanesOf, RoutingPolicies } from "./routing-runtime.ts"
+import { activePromoLanes, overlayKey, PROMO_LANES } from "./routing-policy.ts"
+import type { PromoLane, PromoThresholds } from "./routing-policy.ts"
 import { promoMessage, nudge } from "./routing-signals.ts"
+
+/** A DeepSeek lane's minimum discount cycles through these in the `p` menu. */
+const PROMO_STEPS: readonly (number | null)[] = [0.9, 0.75, 0.5, null]
+const promoStepText = (threshold: number | null): string =>
+  threshold === null ? "끔" : `${Math.round(threshold * 100)}% 이상`
 
 /** `cwd` is where OMO looks for project `.omo/omo.jsonc` files (default: ctx.cwd). */
 export type Deps = { env?: Record<string, string | undefined>; home?: string; cwd?: string; now?: () => number; fetcher?: typeof fetch }
@@ -1801,8 +1807,11 @@ export type EditorOptions = {
   warnings?: readonly string[]
   /** Editing always uses raw base chains; these callbacks are display-only. */
   policies?: {
-    view: () => { promo: boolean; switchProfile: string | null; switching: boolean; summary: string; lines: readonly string[] }
-    setPromo: (on: boolean) => void
+    view: () => {
+      lanes: PromoThresholds; active: readonly PromoLane[]
+      switchProfile: string | null; switching: boolean; summary: string; lines: readonly string[]
+    }
+    setPromoLane: (lane: PromoLane, threshold: number | null) => void
     setSwitchProfile: (name: string | null) => void
   }
   policyConfig?: (raw: unknown) => unknown
@@ -2127,7 +2136,7 @@ export class RoutingEditor {
   private profilesKey(key: string, mode: ProfilesMode): void {
     const names = profileNames(this.raw)
     const policies = this.options.policies
-    const last = names.length + (policies ? 2 : 0)
+    const last = names.length + (policies ? PROMO_LANES.length + 1 : 0)
     switch (key) {
       case "up": mode.cursor = Math.max(0, mode.cursor - 1); return
       case "down": mode.cursor = Math.min(last, mode.cursor + 1); return
@@ -2137,9 +2146,11 @@ export class RoutingEditor {
         if (policies && mode.cursor > names.length) {
           try {
             const view = policies.view()
-            if (mode.cursor === names.length + 1) {
-              policies.setPromo(!view.promo)
-              this.say(`DeepSeek 할인 자동 ${view.promo ? "끔" : "켬"}`, "success")
+            const lane = PROMO_LANES[mode.cursor - names.length - 1]?.key
+            if (lane) {
+              const next = PROMO_STEPS[(PROMO_STEPS.indexOf(view.lanes[lane]) + 1) % PROMO_STEPS.length]
+              policies.setPromoLane(lane, next)
+              this.say(`DeepSeek ${lane} ${promoStepText(next)}`, "success")
             } else {
               const next = names[(view.switchProfile === null ? -1 : names.indexOf(view.switchProfile)) + 1] ?? null
               policies.setSwitchProfile(next)
@@ -2688,7 +2699,7 @@ export class RoutingEditor {
   private profileItems(mode: ProfilesMode, width: number): { items: Item[]; focus: number } {
     const names = profileNames(this.raw)
     const policies = this.options.policies?.view()
-    mode.cursor = Math.min(mode.cursor, names.length + (policies ? 2 : 0))
+    mode.cursor = Math.min(mode.cursor, names.length + (policies ? PROMO_LANES.length + 1 : 0))
     const row = (index: number, text: string): Item => {
       const selected = index === mode.cursor
       return { text: `${selected ? "▸" : " "} ${text}`, color: selected ? "accent" : undefined, bold: selected }
@@ -2701,8 +2712,9 @@ export class RoutingEditor {
     if (policies) {
       items.push(
         { text: "정책", bold: true, header: true },
-        row(names.length + 1, `DeepSeek 할인 자동 · ${policies.promo ? "켬" : "끔"}`),
-        row(names.length + 2, `리셋 공지 때 전환 · ${policies.switchProfile ?? "끔"}${policies.switching ? " · 전환 중" : ""}`),
+        ...PROMO_LANES.map(({ key }, index) => row(names.length + 1 + index,
+          `DeepSeek ${key} · ${promoStepText(policies.lanes[key])}${policies.active.includes(key) ? " · 적용 중" : ""}`)),
+        row(names.length + PROMO_LANES.length + 1, `리셋 공지 때 전환 · ${policies.switchProfile ?? "끔"}${policies.switching ? " · 전환 중" : ""}`),
         ...policies.lines.flatMap(line => this.wrapped(line, width, "dim")),
       )
     }
@@ -2897,9 +2909,11 @@ export function createRouting(pi: any, deps: Deps = {}) {
         const preview = policies.preview(policies.base(disk, path), loadBuiltinRouting(env))
         const configured = applyProfile(parseJsonc(disk), resolveProfileName(env)).config
         const model = "opengateway/deepseek/deepseek-v4.1-flash-ultrafast"
-        const present = [["categories", "quick"], ["agents", "explore"], ["agents", "librarian"]]
-          .some(([section, name]) => chainOf(configured?.[section]?.[name]).some(spec => spec.split(":")[0] === model))
-        const message = promoMessage(preview.promoActive && present, state.promo?.nextAt ?? null, ctx?.sessionManager?.getBranch?.() ?? [], nudge(env))
+        const lanes = PROMO_LANES.filter(({ section, key }) => preview.promoLanes.includes(key)
+          && chainOf(configured?.[section]?.[key]).some(spec => spec.split(":")[0] === model)).map(({ key }) => key)
+        const promo = state.promo
+        const discount = promo && promo.nextAt !== null && Date.now() >= promo.nextAt ? promo.discountNext ?? 0 : promo?.discountNow ?? 0
+        const message = promoMessage(lanes.length > 0, promo?.nextAt ?? null, ctx?.sessionManager?.getBranch?.() ?? [], nudge(env, lanes, discount))
         return message && { message }
       } catch (error) {
         ctx.ui?.notify?.(`routing: ${errorText(error)}`, "warning")
@@ -3006,11 +3020,12 @@ export function createRouting(pi: any, deps: Deps = {}) {
         view: () => {
           const state = policies.state()
           return {
-            promo: state.promoEnabled, switchProfile: state.switchProfile, switching: policies.switching() !== null,
+            lanes: promoLanesOf(state), active: activePromoLanes(state.promo, promoLanesOf(state)),
+            switchProfile: state.switchProfile, switching: policies.switching() !== null,
             summary: policies.summary(), lines: policies.details().split("\n").slice(1),
           }
         },
-        setPromo: on => policies.setPromo(on),
+        setPromoLane: (lane, threshold) => policies.setPromoLane(lane, threshold),
         setSwitchProfile: name => policies.setSwitchProfile(name),
       },
       policyConfig: base => parseJsonc(policies.preview(JSON.stringify(base), builtin).text),

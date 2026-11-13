@@ -28,15 +28,20 @@ still applies. Saving a new profile copies authored routing, not temporary
 models. Policies are recomposed for base and every saved profile, so applying a
 profile does not hide the discount.
 
-- **OpenGateway**: enabled by default. At 90% off or more, DeepSeek
-  `deepseek-v4.1-flash-ultrafast` leads quick/explore/librarian, stopping 15 minutes
-  before a known discount end. Expired cached schedules cannot enable it.
+- **OpenGateway**: each of quick, explore and librarian has its own minimum
+  discount, 90% by default, set in the `p` menu to 90%, 75%, 50% or off. While
+  the current discount meets a lane's minimum, DeepSeek
+  `deepseek-v4.1-flash-ultrafast` leads that lane. A lane stops 15 minutes
+  before the known price change unless the next price also meets its minimum.
+  Expired cached schedules cannot enable it, except that a known next price
+  carries a lane up to 2 minutes past the change until the next refresh, so a
+  lane that stays on doesn't flip off and on.
 - **Reset-notice profile switch** (`리셋 공지 때 전환`): off by default. Pick a
   saved profile for it in the `p` menu, for example a `codex` profile you made
   with `+ 새 프로필 저장`. While Codex Reset shows an active Tibo Watch that
   hasn't passed its deadline, every category and agent that profile's own layer
   defines takes the chain the profile resolves to, in base and in every other
-  profile. The DeepSeek promotion still leads its three lanes. The switch ends
+  profile. The DeepSeek promotion still leads its enabled lanes. The switch ends
   by itself when the Watch closes, at the next recomposition. A chain you save
   in the editor during a switch is left out of it for that layer until the
   Watch ends, so your edit applies right away. Disabled nodes and the
@@ -126,7 +131,7 @@ picked (removing, reordering and effort changes still work).
 | View | Keys (also shown in the footer) |
 | --- | --- |
 | list | ↑↓ PgUp PgDn Home End move · Enter/→ open the chain · `r` follow (drop this layer's chain) · `x` disable/enable · `u` undo this node's edit · `h` hidden candidates · Tab base ↔ profile · `c` mark builtin changes reviewed · `p` profile menu · `s` save · `q`/Esc close |
-| profile menu | ↑↓ PgUp PgDn Home End · Enter/→ on `+ 새 프로필 저장` enters a name, on a profile asks to apply it, on `DeepSeek 할인 자동` toggles it, on `리셋 공지 때 전환` cycles off → each profile → off · Esc/←/`q`/`p` back |
+| profile menu | ↑↓ PgUp PgDn Home End · Enter/→ on `+ 새 프로필 저장` enters a name, on a profile asks to apply it, on a `DeepSeek <lane>` row cycles 90% → 75% → 50% → off, on `리셋 공지 때 전환` cycles off → each profile → off · Esc/←/`q`/`p` back |
 | apply confirmation | ↑↓ Home End pick cancel or apply · Enter confirm · Esc/←/`q` back to the menu |
 | profile name | type the name · Backspace · Enter save · Esc back to the menu |
 | chain | ↑↓ move · `a` add after the cursor (Enter on `+ 모델 추가` too) · Enter replace the model · `e` effort · `d`/Delete/Backspace remove · `K`/`J` or Shift+↑/↓ move · `b` copy the builtin chain · `r` follow · `x` disable · `h` hidden · `u` undo · `s` save · Esc/←/`q` back |
@@ -192,8 +197,9 @@ hot reload turned off, `/reload` applies them. The closing notice says so.
 ### Saving as a new profile
 
 `p` opens the profile menu: `+ 새 프로필 저장` (save as a new profile) first,
-then the existing profiles, then a `정책` (policies) section: `DeepSeek 할인
-자동 · 켬|끔` and `리셋 공지 때 전환 · 끔|<profile>` (with ` · 전환 중` while
+then the existing profiles, then a `정책` (policies) section: one
+`DeepSeek <lane> · 90% 이상|75% 이상|50% 이상|끔` row per lane (with ` · 적용 중` while
+it leads that lane) and `리셋 공지 때 전환 · 끔|<profile>` (with ` · 전환 중` while
 switching), followed by dim signal lines (status, forecast, freshness and
 errors). Enter on the first row asks for a name; Enter on an existing profile
 asks whether to apply it (see below); Enter on a policy row changes it at once.

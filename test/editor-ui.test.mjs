@@ -294,18 +294,18 @@ test("p opens the profile menu: save-new first, then the existing profiles; Esc 
 })
 
 test("the profile menu policy rows show live values, skip headers and signals, and invalidate the preview on changes", () => {
-  let promo = true
+  const lanes = { quick: 0.9, explore: 0.9, librarian: null }
   let switchProfile = null
   let previews = 0
   const changes = []
   const { editor } = makeEditor({
     policies: {
       view: () => ({
-        promo, switchProfile, switching: switchProfile !== null,
-        summary: `할인 ${promo ? "자동" : "끔"}`,
+        lanes: { ...lanes }, active: ["explore"], switchProfile, switching: switchProfile !== null,
+        summary: "할인",
         lines: ["Codex 리셋 임박 93%", "신호 상태"],
       }),
-      setPromo: on => { promo = on; changes.push(on) },
+      setPromoLane: (lane, threshold) => { lanes[lane] = threshold; changes.push([lane, threshold]) },
       setSwitchProfile: name => { switchProfile = name; changes.push(name) },
     },
     policyConfig: raw => { previews++; return raw },
@@ -313,7 +313,9 @@ test("the profile menu policy rows show live values, skip headers and signals, a
   const height = editor.render(140).length
   press(editor, "p")
   assert.match(screen(editor), /^정책$/m)
-  assert.match(screen(editor), /^  DeepSeek 할인 자동 · 켬$/m)
+  assert.match(screen(editor), /^  DeepSeek quick · 90% 이상$/m)
+  assert.match(screen(editor), /^  DeepSeek explore · 90% 이상 · 적용 중$/m)
+  assert.match(screen(editor), /^  DeepSeek librarian · 끔$/m)
   assert.match(screen(editor), /^  리셋 공지 때 전환 · 끔$/m)
   assert.match(screen(editor), /^Codex 리셋 임박 93%$/m)
   press(editor, "\x1b[F")
@@ -327,16 +329,21 @@ test("the profile menu policy rows show live values, skip headers and signals, a
     assert.equal(editor.render(140).length, height)
   }
   press(editor, KEY.up, KEY.enter)
-  assert.equal(promo, false)
-  assert.match(screen(editor), /^▸ DeepSeek 할인 자동 · 끔$/m)
+  assert.equal(lanes.librarian, 0.9, "off cycles back to the top threshold")
+  assert.match(screen(editor), /^▸ DeepSeek librarian · 90% 이상$/m)
+  press(editor, KEY.up, KEY.up)
+  for (const label of ["75% 이상", "50% 이상", "끔"]) {
+    press(editor, KEY.enter)
+    assert.match(screen(editor), new RegExp(`^▸ DeepSeek quick · ${label}$`, "m"))
+  }
   press(editor, "\x1b[H")
   assert.match(screen(editor), /^▸ \+ 새 프로필 저장$/m)
   press(editor, "\x1b[6~")
   assert.match(screen(editor), /^▸ 리셋 공지 때 전환 · 끔$/m)
   press(editor, "\x1b[5~")
   assert.match(screen(editor), /^▸ \+ 새 프로필 저장$/m)
-  assert.deepEqual(changes, ["work", "legacy", "both", null, false])
-  assert.equal(previews, 6, "each policy change recomputes the effective node preview")
+  assert.deepEqual(changes, ["work", "legacy", "both", null, ["librarian", 0.9], ["quick", 0.75], ["quick", 0.5], ["quick", null]])
+  assert.equal(previews, 9, "each policy change recomputes the effective node preview")
 })
 
 test("policy menu rows fit styled and narrow viewports without changing the reserved height", () => {
@@ -346,8 +353,8 @@ test("policy menu rows fit styled and narrow viewports without changing the rese
       const { editor } = makeEditor({
         theme: styled, rows: () => 24,
         policies: {
-          view: () => ({ promo: true, switchProfile: "work", switching: true, summary: "임시 정책", lines: ["Codex 리셋 예측: 24h 90% · 48h 95%", "신호 오류 상세 ".repeat(10)] }),
-          setPromo() {}, setSwitchProfile() {},
+          view: () => ({ lanes: { quick: 0.9, explore: 0.75, librarian: null }, active: ["quick"], switchProfile: "work", switching: true, summary: "임시 정책", lines: ["Codex 리셋 예측: 24h 90% · 48h 95%", "신호 오류 상세 ".repeat(10)] }),
+          setPromoLane() {}, setSwitchProfile() {},
         },
       })
       const height = editor.render(width).length
@@ -361,8 +368,8 @@ test("policy menu rows fit styled and narrow viewports without changing the rese
   const { editor } = makeEditor({
     raw: {},
     policies: {
-      view: () => ({ promo: true, switchProfile: null, switching: false, summary: "", lines: [] }),
-      setPromo() {}, setSwitchProfile: name => assert.equal(name, null),
+      view: () => ({ lanes: { quick: 0.9, explore: 0.9, librarian: 0.9 }, active: [], switchProfile: null, switching: false, summary: "", lines: [] }),
+      setPromoLane() {}, setSwitchProfile: name => assert.equal(name, null),
     },
   })
   press(editor, "p", "\x1b[F", KEY.enter)

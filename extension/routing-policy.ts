@@ -9,8 +9,24 @@ import {
 } from "./routing.ts"
 
 export type { PromoSchedule }
+/** The lanes DeepSeek can lead, each with the minimum discount that enables it. */
+export const PROMO_LANES = [
+  { key: "quick", section: "categories" },
+  { key: "explore", section: "agents" },
+  { key: "librarian", section: "agents" },
+] as const
+export type PromoLane = typeof PROMO_LANES[number]["key"]
+export type PromoThresholds = Readonly<Record<PromoLane, number | null>>
+export const PROMO_THRESHOLDS: PromoThresholds = { quick: 0.9, explore: 0.9, librarian: 0.9 }
+/** A known next price keeps a lane past its boundary until the next refresh lands. */
+const BOUNDARY_GRACE_MS = 2 * 60_000
+const END_GUARD_MS = 15 * 60_000
+const EPSILON = 1e-9
+
 export type PolicySettings = {
   readonly promo: PromoSchedule | null
+  /** Defaults to PROMO_THRESHOLDS; null turns a lane off. */
+  readonly promoLanes?: PromoThresholds
   readonly overlay: { readonly profile: string; readonly exclude: readonly string[] } | null
 }
 export const overlayKey = (profile: string | undefined, section: string, name: string): string =>
@@ -85,26 +101,42 @@ export function unwrapPolicies(text: string, receipt: PolicyReceipt | undefined)
   return out
 }
 
+/** Lanes whose threshold the schedule meets now and, unless the next price
+ * keeps it, for more than fifteen minutes. Expired schedules enable nothing,
+ * except that a known next price carries a lane briefly past its boundary. */
+export function activePromoLanes(promo: PromoSchedule | null, lanes: PromoThresholds = PROMO_THRESHOLDS, now = Date.now()): PromoLane[] {
+  if (promo === null || !Number.isFinite(now) || !Number.isFinite(promo.fetchedAt) || promo.fetchedAt > now
+    || !(promo.discountNow <= 1) || promo.nextAt === null || !Number.isFinite(promo.nextAt)) return []
+  const nextAt = promo.nextAt
+  const next = promo.discountNext ?? 0
+  return PROMO_LANES.map(lane => lane.key).filter(key => {
+    const threshold = lanes[key]
+    if (threshold === null || !(threshold > 0)) return false
+    const meets = (discount: number): boolean => discount <= 1 && discount + EPSILON >= threshold
+    if (now >= nextAt) return now < nextAt + BOUNDARY_GRACE_MS && meets(next)
+    return meets(promo.discountNow) && (meets(next) || now < nextAt - END_GUARD_MS)
+  })
+}
+
 /** Policy is deliberately applied AFTER inheritance for each saved profile.
  * No profile is resolved against another profile's or base's runtime policy.
  * The four arguments are the integration API, with an injectable clock.
  */
 export function composePolicies(baseText: string, settings: PolicySettings, builtin: BuiltinRouting, now = Date.now()): {
-  text: string; receipt: PolicyReceipt; promoActive: boolean; overlayActive: boolean
+  text: string; receipt: PolicyReceipt; promoActive: boolean; promoLanes: PromoLane[]; overlayActive: boolean
 } {
-  const promo = settings.promo
-  const promoActive = promo !== null && Number.isFinite(now) && Number.isFinite(promo.fetchedAt)
-    && promo.fetchedAt <= now && promo.discountNow >= 0.9 && promo.discountNow <= 1
-    && promo.nextAt !== null && Number.isFinite(promo.nextAt) && now < promo.nextAt
-    && ((promo.discountNext ?? 0) >= 0.9 || now < promo.nextAt - 15 * 60_000)
+  const promoLanes = activePromoLanes(settings.promo, settings.promoLanes, now)
+  const promoActive = promoLanes.length > 0
+  const promotes = (section: string, name: string): boolean =>
+    PROMO_LANES.some(lane => lane.section === section && lane.key === name && promoLanes.includes(lane.key))
   if (!promoActive && settings.overlay === null)
-    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, overlayActive: false }
+    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, promoLanes, overlayActive: false }
   const raw: unknown = parseJsonc(baseText)
   const overlay = settings.overlay && !RESERVED.has(settings.overlay.profile)
     && object(at(raw, ["profiles", settings.overlay.profile])) ? settings.overlay : null
   const overlayActive = overlay !== null
   if (!promoActive && !overlayActive)
-    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, overlayActive }
+    return { text: baseText, receipt: emptyPolicyReceipt(), promoActive, promoLanes, overlayActive }
   const overlayConfig = overlay ? applyProfile(raw, overlay.profile).config : undefined
   const overlayResolved = overlayConfig ? resolveRouting(overlayConfig, builtin) : undefined
   const overlayLayer = overlay ? at(raw, ["profiles", overlay.profile]) : undefined
@@ -150,7 +182,7 @@ export function composePolicies(baseText: string, settings: PolicySettings, buil
     for (const section of ["categories", "agents"] as const) {
       const names = new Set(Object.keys(resolved.config[section]))
       if (overlayActive) for (const name of Object.keys(object(at(overlayOwn, [section])) ? at(overlayOwn, [section]) as Record<string, unknown> : {})) names.add(name)
-      if (promoActive) for (const name of section === "categories" ? ["quick"] : ["explore", "librarian"]) names.add(name)
+      for (const lane of PROMO_LANES) if (lane.section === section && promoLanes.includes(lane.key)) names.add(lane.key)
       for (const name of names) {
         if (RESERVED.has(name) || resolved.sources[section][name] === "disabled") continue
         const ownChain: string[] = resolved.config[section][name]?.models ?? []
@@ -159,8 +191,7 @@ export function composePolicies(baseText: string, settings: PolicySettings, buil
           && object(at(overlayOwn, [section])) && Object.hasOwn(at(overlayOwn, [section]) as object, name)
           && overlayResolved.sources[section][name] !== "disabled"
         const chain: string[] = overlaid ? overlayResolved.config[section][name]?.models ?? [] : ownChain
-        const promotional = promoActive && (section === "categories" ? name === "quick" : name === "explore" || name === "librarian")
-        const reordered = promotional ? [PROMO, ...chain] : chain
+        const reordered = promotes(section, name) ? [PROMO, ...chain] : chain
         // A chain the policy rewrites is pinned into the config: drop the exact
         // repeats OMO's builtin resolution yields (primary, then fallbacks led by it).
         const wanted = isDeepStrictEqual(reordered, ownChain) ? ownChain : [...new Set(reordered)]
@@ -189,5 +220,5 @@ export function composePolicies(baseText: string, settings: PolicySettings, buil
       }
     }
   }
-  return { text, receipt: { version: 1, changes }, promoActive, overlayActive }
+  return { text, receipt: { version: 1, changes }, promoActive, promoLanes, overlayActive }
 }

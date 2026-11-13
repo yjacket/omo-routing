@@ -208,12 +208,24 @@ export function signalStatus(
 }
 
 /** Hidden typed-prompt hint naming the installed mass-ulw SKILL.md when it exists. */
-export function nudge(env: Record<string, string | undefined> = process.env): string {
+export function nudge(
+  env: Record<string, string | undefined> = process.env,
+  lanes: readonly string[] = ["quick", "explore", "librarian"],
+  discount = 0.9,
+): string {
   const path = env.OMO_BIN ? join(dirname(env.OMO_BIN), "..", "plugin", "skills", "mass-ulw", "SKILL.md") : undefined
   const skill = path && existsSync(path) ? path : undefined
   const read = skill ? ` (read ${skill} with the read tool first and follow it)` : " (read the mass-ulw skill first and follow it)"
+  const quick = lanes.includes("quick")
+  const agents = lanes.filter(lane => lane !== "quick")
+  const agentText = agents.length ? `the ${agents.join("/")} agent${agents.length > 1 ? "s" : ""}` : ""
+  const who = [quick ? "category quick" : "", agentText].filter(Boolean).join(" and ")
+  const advice = [
+    agents.length ? `plan with many parallel ${agents.join("/")} searches` : "",
+    quick ? `implement through mass-ulw workflows${read}, split into as many self-contained quick lanes (named files, steps, success check) as the work safely allows` : "",
+  ].filter(Boolean).join("; ")
   return `<routing-promo-nudge>
-Until a routing-promo-end note, category quick and the explore/librarian agents run on a 90%-off model; other categories and your own direct work cost as usual. For non-trivial code work: plan with many parallel explore/librarian searches; implement through mass-ulw workflows${read}, split into as many self-contained quick lanes (named files, steps, success check) as the work safely allows. Route a lane above quick only with a one-line reason.
+Until a routing-promo-end note, ${who} run${agents.length > 1 || (quick && agents.length > 0) ? "" : "s"} on a ${Math.round(discount * 100)}%-off model; other categories and your own direct work cost as usual. For non-trivial code work: ${advice}.${quick ? " Route a lane above quick only with a one-line reason." : ""}
 </routing-promo-nudge>`
 }
 

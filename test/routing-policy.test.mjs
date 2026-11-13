@@ -18,7 +18,8 @@ const compose = (text, options = settings, builtin = BUILTIN) => composePolicies
 test("promotion requires a known current window and stops exactly fifteen minutes early", () => {
   const schedules = [
     null, { ...SCHEDULE, discountNow: 0.899 }, { ...SCHEDULE, nextAt: null },
-    { ...SCHEDULE, nextAt: NOW + 900_000 }, { ...SCHEDULE, nextAt: NOW - 1, discountNext: 1 },
+    { ...SCHEDULE, nextAt: NOW + 900_000 }, { ...SCHEDULE, nextAt: NOW - 120_000, discountNext: 1 },
+    { ...SCHEDULE, nextAt: NOW - 1, discountNext: 0.5 },
     { ...SCHEDULE, fetchedAt: NOW + 1 }, { ...SCHEDULE, fetchedAt: NaN },
     { ...SCHEDULE, nextAt: Infinity }, { ...SCHEDULE, discountNow: Infinity },
   ]
@@ -29,6 +30,26 @@ test("promotion requires a known current window and stops exactly fifteen minute
   }
   assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW + 900_001 }, overlay: null }).promoActive, true)
   assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW + 1, discountNext: 0.9 }, overlay: null }).promoActive, true)
+  assert.equal(compose("{}", { promo: { ...SCHEDULE, nextAt: NOW - 119_999, discountNext: 0.9 }, overlay: null }).promoActive, true,
+    "a known next price carries the lane until the next refresh")
+})
+
+test("each lane follows its own minimum discount across a 90% to 50% boundary", () => {
+  const promoLanes = { quick: 0.5, explore: 0.9, librarian: null }
+  const at = (promo, now = NOW) => composePolicies("{}", { promo, promoLanes, overlay: null }, BUILTIN, now)
+  const ending = { ...SCHEDULE, nextAt: NOW + 600_000, discountNext: 0.5 }
+  // Ten minutes before 90% turns into 50%: the 90% lane has stopped, the 50% lane continues.
+  assert.deepEqual(at({ ...ending, nextAt: NOW + 3_600_000 }).promoLanes, ["quick", "explore"])
+  const before = at(ending)
+  assert.deepEqual(before.promoLanes, ["quick"])
+  assert.equal(chain(before.text, "categories", "quick")[0], PROMO)
+  assert.notEqual(chain(before.text, "agents", "explore")[0], PROMO)
+  assert.notEqual(chain(before.text, "agents", "librarian")?.[0], PROMO)
+  // Past the boundary with the cached schedule, then the refreshed 50% one.
+  assert.deepEqual(at(ending, NOW + 660_000).promoLanes, ["quick"])
+  assert.deepEqual(at({ fetchedAt: NOW, discountNow: 0.5, nextAt: NOW + 7_200_000, discountNext: 0.9 }).promoLanes, ["quick"])
+  assert.deepEqual(at({ ...SCHEDULE, discountNow: 0.49 }).promoLanes, [])
+  assert.deepEqual(composePolicies("{}", { promo: SCHEDULE, promoLanes: { quick: null, explore: null, librarian: null }, overlay: null }, BUILTIN, NOW).promoLanes, [])
 })
 
 test("promotion prefixes only the three lanes and preserves builtin fallback candidates", () => {
