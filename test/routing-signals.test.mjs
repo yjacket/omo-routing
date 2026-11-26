@@ -258,4 +258,7 @@ test("nudge keeps machine tokens and points to the installed skill only when it 
   mkdirSync(join(dir, "plugin", "skills", "mass-ulw"), { recursive: true })
   writeFileSync(skill, "# fixture")
   assert.equal(nudge(env).includes(skill), true)
+  // The standalone binary runtime keeps omo.exe beside plugin/.
+  mkdirSync(join(dir, "plugin", "extensions"))
+  assert.equal(nudge({ OMO_BIN: join(dir, "omo.exe") }).includes(skill), true)
 })

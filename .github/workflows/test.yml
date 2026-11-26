@@ -11,6 +11,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: install package dependencies
+        run: npm ci
       - name: install omo engine (omo-ai)
         run: npm install -g omo-ai
       - name: point tests at the installed engine

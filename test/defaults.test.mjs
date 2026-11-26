@@ -204,15 +204,23 @@ test("source discovery requires a known installed launcher and never guesses ano
   assert.equal(routing.loadBuiltinRouting({}).status, "unavailable")
 })
 
-test("without the @babel/parser installed with OMO nothing is claimed", t => {
-  const home = mkdtempSync(join(tmpdir(), "routing-no-parser-"))
+// The standalone binary runtime: omo.exe beside plugin/ in ~/.omo/binary-runtime/<version>/,
+// its dependencies bundled into the executable, so no @babel/parser under the root.
+test("the standalone binary runtime layout yields the builtin defaults and its version", t => {
+  const home = mkdtempSync(join(tmpdir(), "routing-binary-runtime-"))
   t.after(() => rmSync(home, { recursive: true, force: true }))
-  mkdirSync(join(home, "plugin", "extensions"), { recursive: true })
-  writeFileSync(join(home, "plugin", "extensions", "omo-task.js"), TASK_SOURCE)
-  writeFileSync(join(home, "plugin", "extensions", "omo.js"), MAIN_SOURCE)
-  const result = routing.loadBuiltinRouting({ OMO_BIN: join(home, "bin", "omo.js") })
-  assert.equal(result.status, "unavailable")
-  assert.match(result.reason, /@babel\/parser/)
+  const root = join(home, "binary-runtime", "5.1.83")
+  mkdirSync(join(root, "plugin", "extensions"), { recursive: true })
+  writeFileSync(join(root, "omo.exe"), "")
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "omo", version: "5.1.83" }))
+  writeFileSync(join(root, "plugin", "extensions", "omo-task.js"), TASK_SOURCE)
+  writeFileSync(join(root, "plugin", "extensions", "omo.js"), MAIN_SOURCE)
+  const env = { OMO_BIN: join(root, "omo.exe") }
+  const result = routing.loadBuiltinRouting(env)
+  assert.equal(result.status, "loaded", result.reason)
+  assert.deepEqual(result.defaults.unavailable, {})
+  assert.deepEqual(routing.resolveRouting({}, result).display.categories.quick, ["{one|two}/fast:low"])
+  assert.equal(routing.omoVersion(env), "5.1.83")
 })
 
 // Upgrade detector: the bundles of the omo-ai install running these tests.

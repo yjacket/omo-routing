@@ -207,13 +207,22 @@ export function signalStatus(
   return parts.length ? parts.join(" | ") : undefined
 }
 
+/** The OMO install root of the launcher in OMO_BIN: `<root>/bin/omo.js` in an npm
+ * or bun install, `<root>/omo.exe` in the standalone binary runtime
+ * (`~/.omo/binary-runtime/<version>/`). The root is the directory holding
+ * `plugin/extensions`. */
+export function omoRoot(bin: string): string {
+  const beside = dirname(bin)
+  return existsSync(join(beside, "plugin", "extensions")) ? beside : join(beside, "..")
+}
+
 /** Hidden typed-prompt hint naming the installed mass-ulw SKILL.md when it exists. */
 export function nudge(
   env: Record<string, string | undefined> = process.env,
   lanes: readonly string[] = ["quick", "explore", "librarian"],
   discount = 0.9,
 ): string {
-  const path = env.OMO_BIN ? join(dirname(env.OMO_BIN), "..", "plugin", "skills", "mass-ulw", "SKILL.md") : undefined
+  const path = env.OMO_BIN ? join(omoRoot(env.OMO_BIN), "plugin", "skills", "mass-ulw", "SKILL.md") : undefined
   const skill = path && existsSync(path) ? path : undefined
   const read = skill ? ` (read ${skill} with the read tool first and follow it)` : " (read the mass-ulw skill first and follow it)"
   const quick = lanes.includes("quick")

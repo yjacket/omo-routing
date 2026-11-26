@@ -286,12 +286,16 @@ Config overlays follow `omo-task.js`:
 - A user `model_profiles.<name>` replaces the builtin profile completely,
   even with no models. `model_profile` can also directly pin `provider/model`.
 
-Builtin discovery uses the host launcher's `OMO_BIN` to locate
-`../plugin/extensions/omo-task.js` (categories, agents, category inheritance)
+Builtin discovery uses the host launcher's `OMO_BIN` to find the install root
+(the directory holding `plugin/extensions`: one level above `bin/omo.js` in an
+npm or bun install, beside `omo.exe` in the standalone binary runtime under
+`~/.omo/binary-runtime/<version>/`) and reads
+`plugin/extensions/omo-task.js` (categories, agents, category inheritance)
 and `omo.js` (main model profiles). OMO exports neither these tables nor the
 functions that resolve them, so the bundles are parsed with the
-`@babel/parser` that omo-ai itself installs (resolved from the install root):
-a JS parser reads the minified syntax (`!0`, `void 0`, spreads, quoting), not
+`@babel/parser` installed with OMO (resolved from the install root), or this
+package's own `@babel/parser` dependency where the root has none (the binary
+runtime bundles its dependencies into the executable): a JS parser reads the minified syntax (`!0`, `void 0`, spreads, quoting), not
 a hand-written tokenizer. Tables are recognized by their AST shape, not by
 minified variable names, field order or category names. Only constant data is
 evaluated — literals, operators over them, arrays and plain objects — in a
@@ -345,12 +349,13 @@ Keep live checks away from your real setup: point `HOME`, `USERPROFILE`, `APPDAT
 
 ### Tests
 
-`npm test` runs `node --test`.
+Run `npm ci` once, then `npm test` (`node --test`).
 
 Node ≥ 22.6: tests are `.mjs` and import `extension/routing.ts` directly
 through Node's built-in type stripping. A fake `pi`/`ctx` harness supplies the
 command registry, `ui.custom`, a model registry and a temp `$HOME` with a
-fixture `omo.jsonc`. No senpi, no LLM calls. Fixture installs borrow the
+fixture `omo.jsonc`. No senpi, no LLM calls. The binary-runtime fixture uses
+this package's own `@babel/parser`; npm-layout fixture installs borrow the
 `@babel/parser` of the omo-ai install that `OMO_BIN` points at, so run the
 tests inside omo (or set `OMO_BIN`); one test reads that install's bundles
 themselves, so an OMO upgrade that changes their shape fails it.
@@ -363,7 +368,7 @@ themselves, so an OMO upgrade that changes their shape fails it.
   backoff. Builtin model/provider IDs are taken as declared by OMO, before
   registry alias normalization. Session/CLI model overrides and runtime retry
   filtering are not shown.
-- Builtins require `OMO_BIN`, the `@babel/parser` installed with omo-ai, and
+- Builtins require `OMO_BIN`, an `@babel/parser` (OMO's or this package's), and
   recognizable table shapes. Bare Senpi or a future incompatible bundle gets
   configured chains only, with a warning for the affected sections, not
   guessed defaults.

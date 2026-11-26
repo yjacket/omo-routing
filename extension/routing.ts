@@ -29,7 +29,7 @@ import { isDeepStrictEqual } from "node:util"
 import { promoLanesOf, RoutingPolicies } from "./routing-runtime.ts"
 import { activePromoLanes, overlayKey, PROMO_LANES } from "./routing-policy.ts"
 import type { PromoLane, PromoThresholds } from "./routing-policy.ts"
-import { promoMessage, nudge } from "./routing-signals.ts"
+import { promoMessage, nudge, omoRoot } from "./routing-signals.ts"
 
 /** A DeepSeek lane's minimum discount cycles through these in the `p` menu. */
 const PROMO_STEPS: readonly (number | null)[] = [0.9, 0.75, 0.5, null]
@@ -561,10 +561,18 @@ function readProfiles(bundle: Bundle, defaults: BuiltinDefaults): void {
   defaults.descriptions.model_profiles = descriptions
 }
 
-/** The @babel/parser omo-ai installs (a declared dependency), resolved from the
- * install root so the reader follows whatever syntax that OMO build emits. */
+/** The @babel/parser installed with OMO, resolved from the install root so the
+ * reader follows whatever syntax that OMO build emits. The standalone binary
+ * runtime bundles its dependencies into the executable and ships no parser
+ * file, so this package's own @babel/parser dependency is used there. */
 function omoParser(root: string): (source: string) => AstNode {
-  const { parse } = createRequire(join(root, "package.json"))("@babel/parser")
+  let installed: { parse: (source: string, options: object) => { program: AstNode } }
+  try {
+    installed = createRequire(join(root, "package.json"))("@babel/parser")
+  } catch {
+    installed = createRequire(import.meta.url)("@babel/parser")
+  }
+  const { parse } = installed
   return source => parse(source, { sourceType: "module" }).program
 }
 
@@ -575,7 +583,7 @@ let cached: { key: string; routing: BuiltinRouting } | undefined
 /** OMO's launcher exports OMO_BIN. Do not guess a different global installation. */
 export function loadBuiltinRouting(env: Record<string, string | undefined>): BuiltinRouting {
   if (!env.OMO_BIN) return { status: "unavailable", reason: "OMO_BIN is not set; installed OMO source cannot be located" }
-  const root = join(dirname(env.OMO_BIN), "..")
+  const root = omoRoot(env.OMO_BIN)
   const extensions = join(root, "plugin", "extensions")
   const sources = new Map(["omo-task.js", "omo.js"].map(name => {
     const file = join(extensions, name)
@@ -594,7 +602,7 @@ export function loadBuiltinRouting(env: Record<string, string | undefined>): Bui
   try {
     parse = omoParser(root)
   } catch (error) {
-    return { status: "unavailable", reason: `cannot load the @babel/parser installed with OMO in ${root}: ${errorText(error)}` }
+    return { status: "unavailable", reason: `cannot load @babel/parser from OMO in ${root} or from omo-routing: ${errorText(error)}` }
   }
   const bundles = new Map([...sources].map(([name, source]) =>
     [name, typeof source === "string" ? parseBundle(join(extensions, name), source, parse) : source] as const))
@@ -1178,7 +1186,7 @@ export function effortLevels(model: ModelInfo | undefined, host?: ThinkingLevels
  * imported from its file (package exports are not assumed). */
 export async function hostThinkingLevels(env: Record<string, string | undefined>): Promise<ThinkingLevelsOf | undefined> {
   if (!env.OMO_BIN) return undefined
-  const root = join(dirname(env.OMO_BIN), "..")
+  const root = omoRoot(env.OMO_BIN)
   // npm nests omo-ai's dependencies under it; a bun global install hoists them beside it.
   const file = [join(root, "node_modules"), dirname(root)]
     .flatMap(modules => [join(modules, "@code-yeongyu", "senpi", "node_modules"), modules])
@@ -1559,7 +1567,7 @@ export const snapshotPath = (home: string): string => join(home, ".omo", "routin
 export function omoVersion(env: Record<string, string | undefined>): string | undefined {
   if (!env.OMO_BIN) return undefined
   try {
-    const version = JSON.parse(readFileSync(join(dirname(env.OMO_BIN), "..", "package.json"), "utf8")).version
+    const version = JSON.parse(readFileSync(join(omoRoot(env.OMO_BIN), "package.json"), "utf8")).version
     return typeof version === "string" ? version : undefined
   } catch {
     return undefined
